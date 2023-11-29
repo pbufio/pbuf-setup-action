@@ -54,11 +54,17 @@ jobs:
         uses: ./
         with:
           version: v0.3.1
-          pbuf_token: "hello_token"
 
       - name: Check pbuf cli
         id: check-pbuf-cli
-        run: pbuf-cli help
+        run: pbuf-cli init pbuf/pbuf-setup-action
+
+      - name: Test Local Action With Config
+        id: test-action
+        uses: ./
+        with:
+          version: v0.3.1
+          pbuf_token: "hello_token"
 
       - name: Check .netrc
         id: check-netrc

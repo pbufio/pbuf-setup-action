@@ -63,7 +63,6 @@ async function run() {
   if (pbuf_token !== '') {
     core.info(`Authenticate in to the pbuf registry`)
 
-    await exec.exec('pbuf-cli', ['init', 'pbufio/pbuf-setup-action'])
     await exec.exec('pbuf-cli', ['auth', pbuf_token])
   }
 
