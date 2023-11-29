@@ -52,6 +52,9 @@ jobs:
       - name: Test Local Action
         id: test-action
         uses: ./
+        with:
+          version: v0.3.1
+          pbuf_token: "hello_token"
 
       - name: Check pbuf cli
         id: check-pbuf-cli
