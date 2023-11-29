@@ -1,18 +1,19 @@
-name: 'The name of your action here'
-description: 'Provide a description here'
-author: 'Your name or organization here'
+name: "pbuf-setup"
+description: "Install pbuf-cli for use in other jobs"
+author: "pbuf.io"
 
-# Define your inputs here.
+branding:
+  color: purple
+  icon: power
+
 inputs:
-  milliseconds:
-    description: 'Your input description here'
-    required: true
-    default: '1000'
-
-# Define your outputs here.
-outputs:
-  time:
-    description: 'Your output description here'
+  version:
+    description: The version of the CLI
+    required: false
+    default: 'v0.3.2'
+  pbuf_token:
+    description: The API token to use with PBUF registry.
+    required: false
 
 runs:
   using: node20

@@ -53,8 +53,19 @@ jobs:
         id: test-action
         uses: ./
         with:
-          milliseconds: 1000
+          version: v0.3.2
 
-      - name: Print Output
-        id: output
-        run: echo "${{ steps.test-action.outputs.time }}"
+      - name: Check pbuf cli
+        id: check-pbuf-cli
+        run: pbuf-cli init pbuf/pbuf-setup-action
+
+      - name: Test Local Action With Config
+        id: test-action-with-config
+        uses: ./
+        with:
+          version: v0.3.2
+          pbuf_token: "hello_token"
+
+      - name: Check .netrc
+        id: check-netrc
+        run: cat ~/.netrc
