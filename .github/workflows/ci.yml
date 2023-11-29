@@ -60,7 +60,7 @@ jobs:
         run: pbuf-cli init pbuf/pbuf-setup-action
 
       - name: Test Local Action With Config
-        id: test-action
+        id: test-action-with-config
         uses: ./
         with:
           version: v0.3.1
