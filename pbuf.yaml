@@ -1,0 +1,10 @@
+version: v1
+name: domain/module-name
+registry:
+  addr: hello.cld
+export:
+  paths:
+    - api
+    - proto
+modules:
+  - name: pbufio/pbuf-registry
