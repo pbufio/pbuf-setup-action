@@ -32,7 +32,7 @@ steps:
   id: pbuf-register
   run: pbuf-cli modules register
 
-- name: Push module
+- name: Push Module
   id: pbuf-push
   run: pbuf-cli modules push ${{ github.ref_name }}
 ```
