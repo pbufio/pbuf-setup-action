@@ -23,7 +23,7 @@ To use this action, include it in your workflow `.yml` file with the necessary i
 ```yml
 steps:
 - name: Install pbuf-cli
-  uses: pbufio/pbuf-setup-action@v1
+  uses: pbufio/pbuf-setup-action@v1.0.0
   with:
     version: 'v0.3.2' # Optional, specify the desired version
     pbuf_token: ${{ secrets.PBUF_TOKEN }} # Optional, your PBUF API token
