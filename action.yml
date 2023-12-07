@@ -10,7 +10,7 @@ inputs:
   version:
     description: The version of the CLI
     required: false
-    default: 'v0.3.2'
+    default: 'v0.4.0'
   pbuf_token:
     description: The API token to use with PBUF registry.
     required: false

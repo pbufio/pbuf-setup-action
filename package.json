@@ -1,7 +1,7 @@
 {
   "name": "pbuf-setup-action",
   "description": "GitHub Action to setup pbuf-cli",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "aatarasoff@gmail.com",
   "exports": {
     ".": "./dist/index.js"
