@@ -44,20 +44,20 @@ describe('action', () => {
 
     expect(runMock).toHaveReturned()
 
-    expect(infoMock).toHaveBeenNthCalledWith(1, 'Installing pbuf cli version v0.3.0')
+    expect(infoMock).toHaveBeenNthCalledWith(
+      1,
+      'Installing pbuf cli version v0.3.0'
+    )
 
     expect(setFailedMock).not.toHaveBeenCalled()
 
     // Check that we run the official install script with the provided version
-    expect(execMock).toHaveBeenCalledWith(
-      '/bin/bash',
-      [
-        '-lc',
-        expect.stringContaining(
-          'curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-cli/main/install.sh | sh -s -- -v v0.3.0'
-        )
-      ]
-    )
+    expect(execMock).toHaveBeenCalledWith('/bin/bash', [
+      '-lc',
+      expect.stringContaining(
+        'curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-cli/main/install.sh | sh -s -- -v v0.3.0'
+      )
+    ])
 
     expect(ioWhichMock).toHaveBeenNthCalledWith(1, 'pbuf', true)
 
