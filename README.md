@@ -14,7 +14,7 @@ The `pbuf-setup` GitHub Action is designed to install `pbuf-cli`, a command-line
 - **Token Auth Support**: Supports usage of a `pbuf_token` for operations requiring authentication with the PBUF registry.
 
 ## Inputs
-- **`version`**: The version of the CLI to install. The default is 'v0.5.0'. This input is optional.
+- **`version`**: The version of the CLI to install. The default is 'v0.9.0'. This input is optional.
 - **`pbuf_token`**: The API token for authenticating with the PBUF registry. This input is optional.
 
 ## Usage
@@ -25,7 +25,7 @@ steps:
 - name: Install pbuf-cli
   uses: pbufio/pbuf-setup-action@v1.1.0
   with:
-    version: 'v0.5.0' # Optional. Specify the desired version
+    version: 'v0.9.0' # Optional. Specify the desired version
     pbuf_token: ${{ secrets.PBUF_TOKEN }} # Optional, your PBUF API token
 
 - name: Register Module
