@@ -3978,7 +3978,7 @@ async function run() {
   }
 
   // Install via official install script
-  const installCmd = `curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-cli/main/install.sh | sh -s -- -v ${version}`
+  const installCmd = `curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-registry/main/scripts/install.sh | sh -s -- -v ${version}`
   await exec.exec('/bin/bash', ['-lc', installCmd])
 
   // Verify pbuf is available on PATH
