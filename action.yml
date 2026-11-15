@@ -43,7 +43,7 @@ inputs:
     required: false
     default: 'false'
   github_token:
-    description: GitHub token used to post or update sticky pull request comments.
+    description: GitHub token used for authenticated latest CLI release lookup and sticky pull request comments.
     required: false
     default: ${{ github.token }}
 
