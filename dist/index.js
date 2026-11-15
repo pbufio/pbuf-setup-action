@@ -3705,7 +3705,7 @@ async function resolveReleaseTag(version, githubToken) {
       : baseHeaders,
     signal: AbortSignal.timeout(15000)
   })
-  if (res.status === 401 && useAuth) {
+  if ((res.status === 401 || res.status === 403) && useAuth) {
     res = await fetch(RELEASE_API_URL, {
       method: 'GET',
       headers: baseHeaders,
@@ -3738,6 +3738,11 @@ function parseExpectedChecksum(checksumsText, archiveName) {
   )
 }
 
+function smokeCheckArg(plainVersion) {
+  const [major, minor] = plainVersion.split('.', 2).map(Number)
+  return major === 0 && minor < 17 ? '--help' : '--version'
+}
+
 async function installPbufCli(version, githubToken) {
   const { osName, archName } = resolvePlatform()
   const tag = await resolveReleaseTag(version, githubToken)
@@ -3748,67 +3753,80 @@ async function installPbufCli(version, githubToken) {
     : path.join(os.homedir(), '.local', 'bin')
   const destBin = path.join(installDir, 'pbuf')
 
-  if (toolCacheRoot && fs.existsSync(destBin)) {
+  if (
+    toolCacheRoot &&
+    fs.existsSync(destBin) &&
+    fs.lstatSync(destBin).isFile()
+  ) {
     core.info(`Reusing cached pbuf ${tag} from ${installDir}`)
-    core.addPath(installDir)
-    await exec.exec(destBin, ['--version'])
-    return destBin
-  }
+  } else {
+    const archiveName = `pbuf_${plainVersion}_${osName}_${archName}.tar.gz`
+    const checksumsUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/checksums.txt`
+    const archiveUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/${archiveName}`
 
-  const archiveName = `pbuf_${plainVersion}_${osName}_${archName}.tar.gz`
-  const checksumsUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/checksums.txt`
-  const archiveUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/${archiveName}`
-
-  core.info(`Downloading ${archiveName} (${tag}) and verifying SHA-256...`)
-  const [checksumsRes, archiveRes] = await Promise.all([
-    fetch(checksumsUrl, { signal: AbortSignal.timeout(30000) }),
-    fetch(archiveUrl, { signal: AbortSignal.timeout(60000) })
-  ])
-  if (!checksumsRes.ok) {
-    throw new Error(
-      `Failed to download checksums.txt for ${tag} (status ${checksumsRes.status})`
-    )
-  }
-  if (!archiveRes.ok) {
-    throw new Error(
-      `Failed to download ${archiveName} (status ${archiveRes.status})`
-    )
-  }
-
-  const checksumsText = await checksumsRes.text()
-  const expectedHash = parseExpectedChecksum(checksumsText, archiveName)
-  const archiveBuffer = Buffer.from(await archiveRes.arrayBuffer())
-  const actualHash = crypto
-    .createHash('sha256')
-    .update(archiveBuffer)
-    .digest('hex')
-  if (actualHash !== expectedHash) {
-    throw new Error(
-      `SHA-256 checksum mismatch for ${archiveName}: expected ${expectedHash}, got ${actualHash}`
-    )
-  }
-
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-cli-'))
-  try {
-    const archivePath = path.join(tmpDir, archiveName)
-    fs.writeFileSync(archivePath, archiveBuffer)
-    await exec.exec('tar', ['-xzf', archivePath, '-C', tmpDir, 'pbuf'])
-
-    const extractedBin = path.join(tmpDir, 'pbuf')
-    if (!fs.existsSync(extractedBin) || !fs.lstatSync(extractedBin).isFile()) {
-      throw new Error(`Regular pbuf binary not found in ${archiveName}`)
+    core.info(`Downloading ${archiveName} (${tag}) and verifying SHA-256...`)
+    const [checksumsRes, archiveRes] = await Promise.all([
+      fetch(checksumsUrl, { signal: AbortSignal.timeout(30000) }),
+      fetch(archiveUrl, { signal: AbortSignal.timeout(60000) })
+    ])
+    if (!checksumsRes.ok) {
+      throw new Error(
+        `Failed to download checksums.txt for ${tag} (status ${checksumsRes.status})`
+      )
+    }
+    if (!archiveRes.ok) {
+      throw new Error(
+        `Failed to download ${archiveName} (status ${archiveRes.status})`
+      )
     }
 
-    fs.mkdirSync(installDir, { recursive: true })
-    fs.copyFileSync(extractedBin, destBin)
-    fs.chmodSync(destBin, 0o755)
-  } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true })
+    const checksumsText = await checksumsRes.text()
+    const expectedHash = parseExpectedChecksum(checksumsText, archiveName)
+    const archiveBuffer = Buffer.from(await archiveRes.arrayBuffer())
+    const actualHash = crypto
+      .createHash('sha256')
+      .update(archiveBuffer)
+      .digest('hex')
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        `SHA-256 checksum mismatch for ${archiveName}: expected ${expectedHash}, got ${actualHash}`
+      )
+    }
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-cli-'))
+    let stagedBin = ''
+    try {
+      const archivePath = path.join(tmpDir, archiveName)
+      fs.writeFileSync(archivePath, archiveBuffer)
+      await exec.exec('tar', ['-xzof', archivePath, '-C', tmpDir, 'pbuf'])
+
+      const extractedBin = path.join(tmpDir, 'pbuf')
+      if (
+        !fs.existsSync(extractedBin) ||
+        !fs.lstatSync(extractedBin).isFile()
+      ) {
+        throw new Error(`Regular pbuf binary not found in ${archiveName}`)
+      }
+
+      fs.mkdirSync(installDir, { recursive: true })
+      stagedBin = path.join(
+        installDir,
+        `.pbuf.${process.pid}.${crypto.randomBytes(4).toString('hex')}`
+      )
+      fs.copyFileSync(extractedBin, stagedBin)
+      fs.chmodSync(stagedBin, 0o755)
+      fs.renameSync(stagedBin, destBin)
+      stagedBin = ''
+    } finally {
+      if (stagedBin) {
+        fs.rmSync(stagedBin, { force: true })
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
   }
 
   core.addPath(installDir)
-  await exec.exec(destBin, ['--version'])
-  return destBin
+  await exec.exec(destBin, [smokeCheckArg(plainVersion)])
 }
 
 async function runDriftDiff(workingDirectory, githubToken) {
