@@ -3432,6 +3432,7 @@ exports.debug = debug; // for test
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const fs = __nccwpck_require__(147)
+const net = __nccwpck_require__(808)
 const core = __nccwpck_require__(186)
 const io = __nccwpck_require__(436)
 const exec = __nccwpck_require__(514)
@@ -3439,32 +3440,64 @@ const exec = __nccwpck_require__(514)
 const INSTALL_SCRIPT_URL =
   'https://raw.githubusercontent.com/pbufio/pbuf-registry/main/scripts/install.sh'
 const VERSION_RE = /^(latest|v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$/
-const REGISTRY_ADDR_RE = /^([A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\])(:\d{1,5})?$/
+const HOSTNAME_RE =
+  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
 const VALID_FAIL_ON = new Set(['critical', 'warning', 'info', 'none'])
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const COMMENT_MARKER = '<!-- pbuf-drift-diff -->'
 const MAX_COMMENT_CHARS = 60000
-const CLI_FATAL_LINE_RE =
-  /^(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*(.+)$/
+const CLI_FATAL_TRAILER_RE =
+  /(?:^|\r?\n)(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*([\s\S]*)$/
 
 function normalizeRegistryAddr(raw) {
   const stripped = raw
     .trim()
     .replace(/^https?:\/\//i, '')
     .replace(/\/+$/, '')
-  if (!REGISTRY_ADDR_RE.test(stripped)) {
-    throw new Error(`Invalid registry_url "${raw}" (expected host[:port])`)
+
+  let host = ''
+  let port = ''
+  if (stripped.startsWith('[')) {
+    const match = stripped.match(/^\[([^\]]+)\](?::([1-9]\d{0,4}))?$/)
+    if (!match || net.isIP(match[1]) !== 6) {
+      throw new Error(`Invalid registry_url "${raw}" (expected host[:port])`)
+    }
+    host = match[1]
+    port = match[2] || ''
+  } else if (net.isIP(stripped) === 6) {
+    host = stripped
+  } else {
+    const match = stripped.match(/^([^:]+)(?::([1-9]\d{0,4}))?$/)
+    if (
+      !match ||
+      (net.isIP(match[1]) !== 4 &&
+        (match[1].length > 253 || !HOSTNAME_RE.test(match[1])))
+    ) {
+      throw new Error(`Invalid registry_url "${raw}" (expected host[:port])`)
+    }
+    host = match[1]
+    port = match[2] || ''
   }
-  return stripped
+
+  if (port !== '') {
+    const portNum = Number(port)
+    if (portNum < 1 || portNum > 65535) {
+      throw new Error(`Invalid registry_url "${raw}" (expected host[:port])`)
+    }
+    return net.isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`
+  }
+
+  return host
 }
 
 function buildCommentMarker(workingDirectory = '') {
   const normalized = workingDirectory
     .trim()
+    .replace(/[\r\n<>]/g, '')
     .replace(/\\/g, '/')
-    .replace(/^\.\/+/, '')
-    .replace(/\/+$/, '')
-    .replace(/-->/g, '')
+    .replace(/\/+/g, '/')
+    .replace(/^(?:\.\/)+/, '')
+    .replace(/\/$/, '')
   if (normalized === '' || normalized === '.') {
     return COMMENT_MARKER
   }
@@ -3472,19 +3505,14 @@ function buildCommentMarker(workingDirectory = '') {
 }
 
 function parseDriftCliOutput(rawStdout, rawStderr, exitCode) {
-  let fatalMessage = ''
-  const keptLines = []
-  for (const line of rawStdout.split(/\r?\n/)) {
-    const match = line.match(CLI_FATAL_LINE_RE)
-    if (match) {
-      fatalMessage = match[1].trim()
-    } else {
-      keptLines.push(line)
-    }
-  }
-
-  let cleanedStdout = keptLines.join('\n').trim()
-  let cleanedStderr = rawStderr.replace(/\r?\nUsage:\r?\n[\s\S]*$/, '').trim()
+  const fatalMatch = rawStdout.match(CLI_FATAL_TRAILER_RE)
+  const fatalMessage = fatalMatch ? fatalMatch[1].trim() : ''
+  let cleanedStdout = (
+    fatalMatch ? rawStdout.slice(0, fatalMatch.index) : rawStdout
+  ).trim()
+  let cleanedStderr = rawStderr
+    .replace(/(?:^|\r?\n)Usage:\r?\n[\s\S]*$/, '')
+    .trim()
 
   if (exitCode !== 0 && cleanedStdout !== '') {
     const isDriftMarkdown =
@@ -3576,7 +3604,7 @@ async function upsertPullRequestComment(
         if (!comment || typeof comment.body !== 'string') {
           return false
         }
-        const trimmedBody = comment.body.trimStart()
+        const trimmedBody = comment.body.replace(/\r\n/g, '\n').trimStart()
         return trimmedBody === marker || trimmedBody.startsWith(`${marker}\n`)
       })
       if (found) {
@@ -3718,6 +3746,11 @@ async function run() {
       core.exportVariable('PBUF_REGISTRY_ADDR', addr)
     }
     if (registryInsecure) {
+      if (registryUrl === '' && !process.env.PBUF_REGISTRY_ADDR) {
+        core.warning(
+          'registry_insecure has no effect in pbuf CLI unless registry_url (or PBUF_REGISTRY_ADDR) is set; set registry.insecure: true in pbuf.yaml otherwise.'
+        )
+      }
       core.exportVariable('PBUF_REGISTRY_INSECURE', 'true')
     }
 
@@ -3749,7 +3782,7 @@ async function run() {
 
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
-      await exec.exec('pbuf', ['auth', pbufToken], {
+      await exec.exec('pbuf', ['auth', '--', pbufToken], {
         cwd: workingDirectory || undefined,
         silent: true
       })

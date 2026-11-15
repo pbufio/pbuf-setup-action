@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ''
   registry_insecure:
-    description: Connect to the registry over plaintext gRPC without TLS (sets PBUF_REGISTRY_INSECURE=true).
+    description: Connect to the registry over plaintext gRPC without TLS when registry_url (or PBUF_REGISTRY_ADDR) is set.
     required: false
     default: 'false'
   drift_diff:
@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ''
   working_directory:
-    description: Working directory containing pbuf.yaml for drift diff checks.
+    description: Working directory containing pbuf.yaml for pbuf auth and pbuf drift diff.
     required: false
     default: ''
   comment_on_pr:

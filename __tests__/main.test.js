@@ -75,10 +75,14 @@ describe('action', () => {
       'v0.17.1'
     ])
     expect(ioWhichMock).toHaveBeenCalledWith('pbuf', true)
-    expect(execMock).toHaveBeenCalledWith('pbuf', ['auth', 'pbuf_token_test'], {
-      cwd: 'services/billing',
-      silent: true
-    })
+    expect(execMock).toHaveBeenCalledWith(
+      'pbuf',
+      ['auth', '--', 'pbuf_token_test'],
+      {
+        cwd: 'services/billing',
+        silent: true
+      }
+    )
   })
 
   it('rejects malformed registry_url inputs', async () => {
@@ -406,5 +410,115 @@ describe('action', () => {
     expect(setFailedMock).toHaveBeenCalledWith(
       'Invalid fail_on "bogus" (must be critical, warning, info, or none)'
     )
+  })
+
+  it.each([
+    ['https://[::1]/', '::1'],
+    ['http://[::1]:6777/', '[::1]:6777'],
+    ['::1', '::1'],
+    ['127.0.0.1:6777', '127.0.0.1:6777'],
+    ['pbuf.io', 'pbuf.io']
+  ])('normalizes registry_url %s -> %s', (input, expected) => {
+    expect(main.normalizeRegistryAddr(input)).toBe(expected)
+  })
+
+  it.each([
+    ['[:::::]:6777'],
+    ['registry.internal:0'],
+    ['registry.internal:70000'],
+    ['-bad.host:6777']
+  ])('rejects invalid registry_url %s', input => {
+    expect(() => main.normalizeRegistryAddr(input)).toThrow(
+      'Invalid registry_url'
+    )
+  })
+
+  it.each([
+    ['', main.COMMENT_MARKER],
+    ['.', main.COMMENT_MARKER],
+    ['./', main.COMMENT_MARKER],
+    ['././proto//orders/', '<!-- pbuf-drift-diff:proto/orders -->'],
+    ['proto--->->orders--!>\r\n', '<!-- pbuf-drift-diff:proto----orders--! -->']
+  ])('builds safe comment marker for %j', (dir, expected) => {
+    expect(main.buildCommentMarker(dir)).toBe(expected)
+  })
+
+  it('parses multi-line fatal output and non-timestamped CLI errors cleanly', () => {
+    const res = main.parseDriftCliOutput(
+      'failed to execute command: failed to parse pbuf.yaml:\n  line 4: cannot unmarshal\n',
+      '',
+      1
+    )
+    expect(res.markdown).toBe('')
+    expect(res.errorMessage).toBe(
+      'failed to parse pbuf.yaml:\n  line 4: cannot unmarshal'
+    )
+
+    const noTags = main.parseDriftCliOutput(
+      'No prior published tags found for acme/orders\n',
+      '',
+      0
+    )
+    expect(noTags.markdown).toBe(
+      'No prior published tags found for acme/orders'
+    )
+  })
+
+  it('warns when registry_insecure is set without registry_url and matches CRLF sticky markers', async () => {
+    const eventFile = path.join(tempDir, 'event.json')
+    fs.writeFileSync(eventFile, JSON.stringify({ pull_request: { number: 5 } }))
+    process.env.GITHUB_EVENT_PATH = eventFile
+    process.env.GITHUB_REPOSITORY = 'pbufio/example-protos'
+    delete process.env.PBUF_REGISTRY_ADDR
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.17.1'
+        case 'registry_insecure':
+          return 'true'
+        case 'drift_diff':
+          return 'true'
+        case 'comment_on_pr':
+          return 'true'
+        case 'github_token':
+          return 'ghs_tok'
+        default:
+          return ''
+      }
+    })
+
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'drift') {
+        options.listeners.stdout(
+          Buffer.from('### Schema Drift Diff: `acme/orders`\n')
+        )
+      }
+      return 0
+    })
+
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => [
+          { id: 901, body: `${main.COMMENT_MARKER}\r\nold crlf body` }
+        ]
+      })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) })
+
+    await main.run()
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('registry_insecure has no effect')
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'https://api.github.com/repos/pbufio/example-protos/issues/comments/901',
+      expect.objectContaining({ method: 'PATCH' })
+    )
+    fetchMock.mockRestore()
   })
 })

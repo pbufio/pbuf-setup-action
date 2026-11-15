@@ -14,11 +14,11 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 | `version` | No | `'v0.17.1'` | Version of `pbuf` CLI to install (for example `'v0.17.1'` or `'latest'`). |
 | `pbuf_token` | No | `''` | API token for authenticating with the PBUF registry (`pbuf auth`). |
 | `registry_url` | No | `''` | Self-hosted registry address (`host[:port]` or URL), exported as `PBUF_REGISTRY_ADDR`. |
-| `registry_insecure` | No | `'false'` | When `'true'`, exports `PBUF_REGISTRY_INSECURE=true` for plaintext gRPC connections. |
+| `registry_insecure` | No | `'false'` | When `'true'`, exports `PBUF_REGISTRY_INSECURE=true` for plaintext gRPC connections (used with `registry_url` or `PBUF_REGISTRY_ADDR`). |
 | `drift_diff` | No | `'false'` | When `'true'`, runs `pbuf drift diff --format=markdown` against the registry baseline. |
 | `fail_on` | No | `'critical'` | Severity threshold to fail drift checks (`critical`, `warning`, `info`, or `none`). |
 | `against` | No | `''` | Baseline registry tag to compare against (defaults to the latest published tag). |
-| `working_directory` | No | `''` | Directory containing `pbuf.yaml` when running `pbuf drift diff`. |
+| `working_directory` | No | `''` | Directory containing `pbuf.yaml` for `pbuf auth` and `pbuf drift diff`. |
 | `comment_on_pr` | No | `'false'` | When `'true'` on `pull_request` events, posts or updates a single sticky PR comment (`<!-- pbuf-drift-diff -->`) with the Markdown report. |
 | `github_token` | No | `${{ github.token }}` | GitHub token used to post or update sticky PR comments (requires `pull-requests: write`). |
 
