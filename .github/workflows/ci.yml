@@ -53,11 +53,12 @@ jobs:
         id: test-action
         uses: ./
         with:
-          version: v0.16.0
+          version: v0.17.0
 
       - name: Check pbuf CLI
         id: check-pbuf-cli
         run: |
+          pbuf --version | grep "v0.17.0"
           mkdir -p /tmp/pbuf-smoke && cd /tmp/pbuf-smoke
           pbuf init pbufio/pbuf-setup-action
           test -f pbuf.yaml

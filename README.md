@@ -11,7 +11,7 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 
 | Input | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `version` | No | `'v0.16.0'` | Version of `pbuf` CLI to install (for example `'v0.16.0'` or `'latest'`). |
+| `version` | No | `'v0.17.0'` | Version of `pbuf` CLI to install (for example `'v0.17.0'` or `'latest'`). |
 | `pbuf_token` | No | `''` | API token for authenticating with the PBUF registry (`pbuf auth`). |
 | `drift_diff` | No | `'false'` | When `'true'`, runs `pbuf drift diff --format=markdown` against the registry baseline. |
 | `fail_on` | No | `'critical'` | Severity threshold to fail drift checks (`critical`, `warning`, `info`, or `none`). |
@@ -38,7 +38,7 @@ steps:
   - name: Install pbuf CLI
     uses: pbufio/pbuf-setup-action@v1
     with:
-      version: 'v0.16.0'
+      version: 'v0.17.0'
       pbuf_token: ${{ secrets.PBUF_TOKEN }}
 
   - name: Register and Push Module
