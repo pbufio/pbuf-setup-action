@@ -14,6 +14,14 @@ inputs:
   pbuf_token:
     description: The API token to use with PBUF registry.
     required: false
+  registry_url:
+    description: Registry address (host[:port] or URL) exported as PBUF_REGISTRY_ADDR for self-hosted registries.
+    required: false
+    default: ''
+  registry_insecure:
+    description: Connect to the registry over plaintext gRPC without TLS (sets PBUF_REGISTRY_INSECURE=true).
+    required: false
+    default: 'false'
   drift_diff:
     description: Run pbuf drift diff against the registry baseline.
     required: false

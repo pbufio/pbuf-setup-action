@@ -13,6 +13,8 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 | :--- | :--- | :--- | :--- |
 | `version` | No | `'v0.17.1'` | Version of `pbuf` CLI to install (for example `'v0.17.1'` or `'latest'`). |
 | `pbuf_token` | No | `''` | API token for authenticating with the PBUF registry (`pbuf auth`). |
+| `registry_url` | No | `''` | Self-hosted registry address (`host[:port]` or URL), exported as `PBUF_REGISTRY_ADDR`. |
+| `registry_insecure` | No | `'false'` | When `'true'`, exports `PBUF_REGISTRY_INSECURE=true` for plaintext gRPC connections. |
 | `drift_diff` | No | `'false'` | When `'true'`, runs `pbuf drift diff --format=markdown` against the registry baseline. |
 | `fail_on` | No | `'critical'` | Severity threshold to fail drift checks (`critical`, `warning`, `info`, or `none`). |
 | `against` | No | `''` | Baseline registry tag to compare against (defaults to the latest published tag). |

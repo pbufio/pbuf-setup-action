@@ -7,6 +7,9 @@ on:
       - main
       - "releases/*"
 
+permissions:
+  contents: read
+
 jobs:
   test-javascript:
     name: JavaScript Tests
@@ -69,7 +72,8 @@ jobs:
         with:
           version: latest
           pbuf_token: "hello_token"
+          registry_url: "registry.internal:6777"
 
       - name: Check .netrc
         id: check-netrc
-        run: test -s ~/.netrc
+        run: grep -q "machine registry.internal" ~/.netrc
