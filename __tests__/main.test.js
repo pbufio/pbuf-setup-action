@@ -1,14 +1,15 @@
 /**
  * Unit tests for the action's main functionality, src/main.js
  */
+const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const core = require('@actions/core')
-const io = require('@actions/io')
 const exec = require('@actions/exec')
 const main = require('../src/main')
 
+const addPathMock = jest.spyOn(core, 'addPath').mockImplementation()
 const infoMock = jest.spyOn(core, 'info').mockImplementation()
 const warningMock = jest.spyOn(core, 'warning').mockImplementation()
 const getInputMock = jest.spyOn(core, 'getInput').mockImplementation()
@@ -16,12 +17,13 @@ const setFailedMock = jest.spyOn(core, 'setFailed').mockImplementation()
 const setOutputMock = jest.spyOn(core, 'setOutput').mockImplementation()
 const setSecretMock = jest.spyOn(core, 'setSecret').mockImplementation()
 const exportVarMock = jest.spyOn(core, 'exportVariable').mockImplementation()
-const ioWhichMock = jest.spyOn(io, 'which').mockImplementation()
 const execMock = jest.spyOn(exec, 'exec').mockImplementation()
 
 describe('action', () => {
   const originalEnv = process.env
+  const { osName, archName } = main.resolvePlatform()
   let tempDir
+  let toolCacheDir
 
   beforeEach(() => {
     jest.clearAllMocks()
@@ -32,6 +34,13 @@ describe('action', () => {
     delete process.env.GITHUB_TOKEN
     delete process.env.GITHUB_API_URL
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-action-test-'))
+    toolCacheDir = path.join(tempDir, 'tool-cache')
+    process.env.RUNNER_TOOL_CACHE = toolCacheDir
+    const cachedDir = path.join(toolCacheDir, 'pbuf', '0.17.1', archName)
+    fs.mkdirSync(cachedDir, { recursive: true })
+    fs.writeFileSync(path.join(cachedDir, 'pbuf'), '#!/bin/sh\n', {
+      mode: 0o755
+    })
     execMock.mockResolvedValue(0)
   })
 
@@ -40,7 +49,36 @@ describe('action', () => {
     fs.rmSync(tempDir, { recursive: true, force: true })
   })
 
-  it('installs a pinned CLI version, exports registry_url, and authenticates in working_directory', async () => {
+  it('downloads pinned CLI tarball, verifies SHA-256 checksum, caches binary, and authenticates in working_directory', async () => {
+    fs.rmSync(toolCacheDir, { recursive: true, force: true })
+    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const fakeArchive = Buffer.from('fake-tar-gz-bytes')
+    const archiveSha = crypto
+      .createHash('sha256')
+      .update(fakeArchive)
+      .digest('hex')
+
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => `${archiveSha}  ${archiveName}\n`
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => fakeArchive
+      })
+
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'tar') {
+        const destIdx = args.indexOf('-C')
+        fs.writeFileSync(path.join(args[destIdx + 1], 'pbuf'), 'binary-data')
+      }
+      return 0
+    })
+
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
@@ -60,6 +98,13 @@ describe('action', () => {
 
     await main.run()
 
+    const expectedInstallDir = path.join(
+      toolCacheDir,
+      'pbuf',
+      '0.17.1',
+      archName
+    )
+    const expectedBin = path.join(expectedInstallDir, 'pbuf')
     expect(setFailedMock).not.toHaveBeenCalled()
     expect(exportVarMock).toHaveBeenCalledWith(
       'PBUF_REGISTRY_ADDR',
@@ -68,13 +113,9 @@ describe('action', () => {
     expect(exportVarMock).toHaveBeenCalledWith('PBUF_REGISTRY_INSECURE', 'true')
     expect(setSecretMock).toHaveBeenCalledWith('pbuf_token_test')
     expect(infoMock).toHaveBeenCalledWith('Installing pbuf cli version v0.17.1')
-    expect(execMock).toHaveBeenCalledWith('/bin/bash', [
-      '-lc',
-      'curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-registry/main/scripts/install.sh | sh -s -- -v "$1"',
-      '_',
-      'v0.17.1'
-    ])
-    expect(ioWhichMock).toHaveBeenCalledWith('pbuf', true)
+    expect(fs.existsSync(expectedBin)).toBe(true)
+    expect(addPathMock).toHaveBeenCalledWith(expectedInstallDir)
+    expect(execMock).toHaveBeenCalledWith(expectedBin, ['--version'])
     expect(execMock).toHaveBeenCalledWith(
       'pbuf',
       ['auth', '--', 'pbuf_token_test'],
@@ -83,6 +124,8 @@ describe('action', () => {
         silent: true
       }
     )
+
+    fetchMock.mockRestore()
   })
 
   it('rejects malformed registry_url inputs', async () => {
@@ -105,18 +148,213 @@ describe('action', () => {
     expect(execMock).not.toHaveBeenCalled()
   })
 
-  it('supports installing latest version without -v flag', async () => {
-    getInputMock.mockImplementation(name =>
-      name === 'version' ? 'latest' : ''
-    )
+  it('resolves latest release via authenticated GitHub API and reuses cached binary', async () => {
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'latest'
+      if (name === 'github_token') return 'ghs_release_token'
+      return ''
+    })
+
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ tag_name: 'v0.17.1' })
+    })
 
     await main.run()
 
     expect(setFailedMock).not.toHaveBeenCalled()
-    expect(execMock).toHaveBeenCalledWith('/bin/bash', [
-      '-lc',
-      'curl -fsSL https://raw.githubusercontent.com/pbufio/pbuf-registry/main/scripts/install.sh | sh'
-    ])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.github.com/repos/pbufio/pbuf-registry/releases/latest',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer ghs_release_token'
+        })
+      })
+    )
+    expect(infoMock).toHaveBeenCalledWith(
+      expect.stringContaining('Reusing cached pbuf v0.17.1')
+    )
+
+    fetchMock.mockRestore()
+  })
+
+  it('omits GHES token when resolving latest release on api.github.com and uses --help for < v0.17.0', async () => {
+    process.env.GITHUB_API_URL = 'https://ghes.acme.internal/api/v3'
+    const legacyDir = path.join(toolCacheDir, 'pbuf', '0.16.0', archName)
+    fs.mkdirSync(legacyDir, { recursive: true })
+    const legacyBin = path.join(legacyDir, 'pbuf')
+    fs.writeFileSync(legacyBin, 'legacy-bin', { mode: 0o755 })
+
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'latest'
+      if (name === 'github_token') return 'ghes_secret_token'
+      return ''
+    })
+
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ tag_name: 'v0.16.0' })
+    })
+
+    await main.run()
+
+    expect(setFailedMock).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBeUndefined()
+    expect(execMock).toHaveBeenCalledWith(legacyBin, ['--help'])
+    fetchMock.mockRestore()
+  })
+
+  it('retries latest release lookup anonymously on 403 and rejects malformed tag_name', async () => {
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'latest'
+      if (name === 'github_token') return 'emu_scoped_token'
+      return ''
+    })
+
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({ ok: false, status: 403 })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ tag_name: '../evil' })
+      })
+
+    await main.run()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBeUndefined()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid release tag "../evil" returned by GitHub API'
+    )
+    fetchMock.mockRestore()
+  })
+
+  it('rejects symlink pbuf entries extracted from release archive', async () => {
+    fs.rmSync(toolCacheDir, { recursive: true, force: true })
+    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const fakeArchive = Buffer.from('symlink-tar')
+    const archiveSha = crypto
+      .createHash('sha256')
+      .update(fakeArchive)
+      .digest('hex')
+
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => `${archiveSha}  ${archiveName}\n`
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => fakeArchive
+      })
+
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'tar') {
+        const destIdx = args.indexOf('-C')
+        fs.symlinkSync('/etc/passwd', path.join(args[destIdx + 1], 'pbuf'))
+      }
+      return 0
+    })
+
+    getInputMock.mockImplementation(name =>
+      name === 'version' ? 'v0.17.1' : ''
+    )
+
+    await main.run()
+
+    expect(setFailedMock).toHaveBeenCalledWith(
+      `Regular pbuf binary not found in ${archiveName}`
+    )
+    expect(addPathMock).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it('fails installation when SHA-256 checksum does not match checksums.txt', async () => {
+    fs.rmSync(toolCacheDir, { recursive: true, force: true })
+    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => `${'a'.repeat(64)}  ${archiveName}\n`
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from('tampered-archive')
+      })
+
+    getInputMock.mockImplementation(name =>
+      name === 'version' ? '0.17.1' : ''
+    )
+
+    await main.run()
+
+    expect(setFailedMock).toHaveBeenCalledWith(
+      expect.stringContaining('SHA-256 checksum mismatch')
+    )
+    expect(addPathMock).not.toHaveBeenCalled()
+
+    fetchMock.mockRestore()
+  })
+
+  it('falls back to $HOME/.local/bin when RUNNER_TOOL_CACHE is unset', async () => {
+    delete process.env.RUNNER_TOOL_CACHE
+    const fakeHome = path.join(tempDir, 'home')
+    fs.mkdirSync(fakeHome, { recursive: true })
+    const homedirSpy = jest.spyOn(os, 'homedir').mockReturnValue(fakeHome)
+
+    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const fakeArchive = Buffer.from('rootless-tar')
+    const archiveSha = crypto
+      .createHash('sha256')
+      .update(fakeArchive)
+      .digest('hex')
+
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => `${archiveSha}  ${archiveName}\n`
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => fakeArchive
+      })
+
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'tar') {
+        const destIdx = args.indexOf('-C')
+        fs.writeFileSync(path.join(args[destIdx + 1], 'pbuf'), 'binary-data')
+      }
+      return 0
+    })
+
+    getInputMock.mockImplementation(name =>
+      name === 'version' ? 'v0.17.1' : ''
+    )
+
+    await main.run()
+
+    const fallbackBin = path.join(fakeHome, '.local', 'bin', 'pbuf')
+    expect(setFailedMock).not.toHaveBeenCalled()
+    expect(fs.existsSync(fallbackBin)).toBe(true)
+    expect(addPathMock).toHaveBeenCalledWith(
+      path.join(fakeHome, '.local', 'bin')
+    )
+
+    fetchMock.mockRestore()
+    homedirSpy.mockRestore()
   })
 
   it.each([

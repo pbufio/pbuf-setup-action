@@ -1,7 +1,7 @@
 # `pbuf-setup`
 
 ## Overview
-The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runners, configures registry authentication, and optionally runs `pbuf drift diff` on pull requests with a sticky Markdown summary comment.
+The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runners (with SHA-256 checksum verification against `checksums.txt` and `$RUNNER_TOOL_CACHE` caching), configures registry authentication, and optionally runs `pbuf drift diff` on pull requests with a sticky Markdown summary comment.
 
 ## Requirements
 - GitHub Actions runner with Linux or macOS (`darwin`).
@@ -20,7 +20,7 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 | `against` | No | `''` | Baseline registry tag to compare against (defaults to the latest published tag). |
 | `working_directory` | No | `''` | Directory containing `pbuf.yaml` for `pbuf auth` and `pbuf drift diff`. |
 | `comment_on_pr` | No | `'false'` | When `'true'` on `pull_request` events, posts or updates a single sticky PR comment (`<!-- pbuf-drift-diff -->`) with the Markdown report. |
-| `github_token` | No | `${{ github.token }}` | GitHub token used to post or update sticky PR comments (requires `pull-requests: write`). |
+| `github_token` | No | `${{ github.token }}` | GitHub token used for authenticated `latest` release lookup and sticky PR comments (`pull-requests: write` required for comments). |
 
 ## Outputs
 

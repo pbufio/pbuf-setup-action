@@ -3431,15 +3431,20 @@ exports.debug = debug; // for test
 /***/ 713:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
+const crypto = __nccwpck_require__(113)
 const fs = __nccwpck_require__(147)
 const net = __nccwpck_require__(808)
+const os = __nccwpck_require__(37)
+const path = __nccwpck_require__(17)
 const core = __nccwpck_require__(186)
-const io = __nccwpck_require__(436)
 const exec = __nccwpck_require__(514)
 
-const INSTALL_SCRIPT_URL =
-  'https://raw.githubusercontent.com/pbufio/pbuf-registry/main/scripts/install.sh'
+const RELEASE_API_URL =
+  'https://api.github.com/repos/pbufio/pbuf-registry/releases/latest'
+const RELEASE_DOWNLOAD_BASE =
+  'https://github.com/pbufio/pbuf-registry/releases/download'
 const VERSION_RE = /^(latest|v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$/
+const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/
 const HOSTNAME_RE =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
 const VALID_FAIL_ON = new Set(['critical', 'warning', 'info', 'none'])
@@ -3655,7 +3660,176 @@ async function upsertPullRequestComment(
   }
 }
 
-async function runDriftDiff(workingDirectory) {
+function resolvePlatform(platform = process.platform, arch = process.arch) {
+  let osName = ''
+  if (platform === 'linux') {
+    osName = 'linux'
+  } else if (platform === 'darwin') {
+    osName = 'darwin'
+  } else {
+    throw new Error(`Unsupported operating system "${platform}"`)
+  }
+
+  let archName = ''
+  if (arch === 'x64') {
+    archName = 'amd64'
+  } else if (arch === 'arm64') {
+    archName = 'arm64'
+  } else {
+    throw new Error(`Unsupported architecture "${arch}"`)
+  }
+
+  return { osName, archName }
+}
+
+async function resolveReleaseTag(version, githubToken) {
+  if (version !== 'latest') {
+    return version.startsWith('v') ? version : `v${version}`
+  }
+
+  const baseHeaders = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'pbuf-setup-action',
+    'X-GitHub-Api-Version': '2022-11-28'
+  }
+  const configuredApi = (
+    process.env.GITHUB_API_URL || 'https://api.github.com'
+  ).replace(/\/+$/, '')
+  const useAuth =
+    githubToken !== '' && configuredApi === 'https://api.github.com'
+
+  let res = await fetch(RELEASE_API_URL, {
+    method: 'GET',
+    headers: useAuth
+      ? { ...baseHeaders, Authorization: `Bearer ${githubToken}` }
+      : baseHeaders,
+    signal: AbortSignal.timeout(15000)
+  })
+  if ((res.status === 401 || res.status === 403) && useAuth) {
+    res = await fetch(RELEASE_API_URL, {
+      method: 'GET',
+      headers: baseHeaders,
+      signal: AbortSignal.timeout(15000)
+    })
+  }
+  if (!res.ok) {
+    throw new Error(
+      `Failed to resolve latest pbuf release tag (status ${res.status})`
+    )
+  }
+
+  const data = await res.json()
+  const tagName = typeof data.tag_name === 'string' ? data.tag_name.trim() : ''
+  if (!RELEASE_TAG_RE.test(tagName)) {
+    throw new Error(`Invalid release tag "${tagName}" returned by GitHub API`)
+  }
+  return tagName
+}
+
+function parseExpectedChecksum(checksumsText, archiveName) {
+  for (const line of checksumsText.split(/\r?\n/)) {
+    const match = line.trim().match(/^([0-9a-fA-F]{64})\s+\*?(\S+)$/)
+    if (match && match[2] === archiveName) {
+      return match[1].toLowerCase()
+    }
+  }
+  throw new Error(
+    `Checksum entry for ${archiveName} not found in checksums.txt`
+  )
+}
+
+function smokeCheckArg(plainVersion) {
+  const [major, minor] = plainVersion.split('.', 2).map(Number)
+  return major === 0 && minor < 17 ? '--help' : '--version'
+}
+
+async function installPbufCli(version, githubToken) {
+  const { osName, archName } = resolvePlatform()
+  const tag = await resolveReleaseTag(version, githubToken)
+  const plainVersion = tag.slice(1)
+  const toolCacheRoot = (process.env.RUNNER_TOOL_CACHE || '').trim()
+  const installDir = toolCacheRoot
+    ? path.join(toolCacheRoot, 'pbuf', plainVersion, archName)
+    : path.join(os.homedir(), '.local', 'bin')
+  const destBin = path.join(installDir, 'pbuf')
+
+  if (
+    toolCacheRoot &&
+    fs.existsSync(destBin) &&
+    fs.lstatSync(destBin).isFile()
+  ) {
+    core.info(`Reusing cached pbuf ${tag} from ${installDir}`)
+  } else {
+    const archiveName = `pbuf_${plainVersion}_${osName}_${archName}.tar.gz`
+    const checksumsUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/checksums.txt`
+    const archiveUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/${archiveName}`
+
+    core.info(`Downloading ${archiveName} (${tag}) and verifying SHA-256...`)
+    const [checksumsRes, archiveRes] = await Promise.all([
+      fetch(checksumsUrl, { signal: AbortSignal.timeout(30000) }),
+      fetch(archiveUrl, { signal: AbortSignal.timeout(60000) })
+    ])
+    if (!checksumsRes.ok) {
+      throw new Error(
+        `Failed to download checksums.txt for ${tag} (status ${checksumsRes.status})`
+      )
+    }
+    if (!archiveRes.ok) {
+      throw new Error(
+        `Failed to download ${archiveName} (status ${archiveRes.status})`
+      )
+    }
+
+    const checksumsText = await checksumsRes.text()
+    const expectedHash = parseExpectedChecksum(checksumsText, archiveName)
+    const archiveBuffer = Buffer.from(await archiveRes.arrayBuffer())
+    const actualHash = crypto
+      .createHash('sha256')
+      .update(archiveBuffer)
+      .digest('hex')
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        `SHA-256 checksum mismatch for ${archiveName}: expected ${expectedHash}, got ${actualHash}`
+      )
+    }
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-cli-'))
+    let stagedBin = ''
+    try {
+      const archivePath = path.join(tmpDir, archiveName)
+      fs.writeFileSync(archivePath, archiveBuffer)
+      await exec.exec('tar', ['-xzof', archivePath, '-C', tmpDir, 'pbuf'])
+
+      const extractedBin = path.join(tmpDir, 'pbuf')
+      if (
+        !fs.existsSync(extractedBin) ||
+        !fs.lstatSync(extractedBin).isFile()
+      ) {
+        throw new Error(`Regular pbuf binary not found in ${archiveName}`)
+      }
+
+      fs.mkdirSync(installDir, { recursive: true })
+      stagedBin = path.join(
+        installDir,
+        `.pbuf.${process.pid}.${crypto.randomBytes(4).toString('hex')}`
+      )
+      fs.copyFileSync(extractedBin, stagedBin)
+      fs.chmodSync(stagedBin, 0o755)
+      fs.renameSync(stagedBin, destBin)
+      stagedBin = ''
+    } finally {
+      if (stagedBin) {
+        fs.rmSync(stagedBin, { force: true })
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  }
+
+  core.addPath(installDir)
+  await exec.exec(destBin, [smokeCheckArg(plainVersion)])
+}
+
+async function runDriftDiff(workingDirectory, githubToken) {
   const failOn = (core.getInput('fail_on').trim() || 'critical').toLowerCase()
   if (!VALID_FAIL_ON.has(failOn)) {
     core.setFailed(
@@ -3667,11 +3841,6 @@ async function runDriftDiff(workingDirectory) {
   const against = core.getInput('against').trim()
   const commentOnPr =
     core.getInput('comment_on_pr').trim().toLowerCase() === 'true'
-  const githubToken =
-    core.getInput('github_token') || process.env.GITHUB_TOKEN || ''
-  if (githubToken !== '') {
-    core.setSecret(githubToken)
-  }
 
   const args = ['drift', 'diff', '--format=markdown', `--fail-on=${failOn}`]
   if (against !== '') {
@@ -3731,6 +3900,8 @@ async function run() {
     const registryInsecure =
       core.getInput('registry_insecure').trim().toLowerCase() === 'true'
     const workingDirectory = core.getInput('working_directory').trim()
+    const githubToken =
+      core.getInput('github_token') || process.env.GITHUB_TOKEN || ''
 
     if (version === '') {
       core.setFailed('You must provide a version')
@@ -3757,6 +3928,9 @@ async function run() {
     if (pbufToken !== '') {
       core.setSecret(pbufToken)
     }
+    if (githubToken !== '') {
+      core.setSecret(githubToken)
+    }
 
     core.info(`Installing pbuf cli version ${version}`)
 
@@ -3764,21 +3938,7 @@ async function run() {
       core.info('No pbuf_token provided, skipping login')
     }
 
-    if (version === 'latest') {
-      await exec.exec('/bin/bash', [
-        '-lc',
-        `curl -fsSL ${INSTALL_SCRIPT_URL} | sh`
-      ])
-    } else {
-      await exec.exec('/bin/bash', [
-        '-lc',
-        `curl -fsSL ${INSTALL_SCRIPT_URL} | sh -s -- -v "$1"`,
-        '_',
-        version
-      ])
-    }
-
-    await io.which('pbuf', true)
+    await installPbufCli(version, githubToken)
 
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
@@ -3791,7 +3951,7 @@ async function run() {
     core.info('Successfully setup pbuf cli')
 
     if (core.getInput('drift_diff').trim().toLowerCase() === 'true') {
-      await runDriftDiff(workingDirectory)
+      await runDriftDiff(workingDirectory, githubToken)
     }
   } catch (error) {
     core.setFailed(error instanceof Error ? error.message : String(error))
@@ -3803,6 +3963,8 @@ module.exports = {
   buildCommentMarker,
   normalizeRegistryAddr,
   parseDriftCliOutput,
+  parseExpectedChecksum,
+  resolvePlatform,
   run
 }
 
