@@ -5,8 +5,10 @@ env:
   node: true
 
 globals:
+  AbortSignal: readonly
   Atomics: readonly
   SharedArrayBuffer: readonly
+  fetch: readonly
 
 ignorePatterns:
   - '!.*'
