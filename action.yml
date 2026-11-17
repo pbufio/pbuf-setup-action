@@ -8,9 +8,9 @@ branding:
 
 inputs:
   version:
-    description: The version of the CLI to install (e.g., v0.19.0 or latest)
+    description: The version of the CLI to install (e.g., v0.20.0 or latest)
     required: false
-    default: 'v0.19.0'
+    default: 'v0.20.0'
   pbuf_token:
     description: The API token to use with PBUF registry.
     required: false
