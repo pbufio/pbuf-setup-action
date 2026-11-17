@@ -1,7 +1,7 @@
 {
   "name": "pbuf-setup-action",
   "description": "GitHub Action to setup pbuf-cli",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "author": "aatarasoff@gmail.com",
   "exports": {
     ".": "./dist/index.js"
@@ -12,12 +12,12 @@
   "scripts": {
     "bundle": "npm run format:write && npm run package",
     "ci-test": "jest",
-    "format:write": "prettier --write **/*.js",
-    "format:check": "prettier --check **/*.js",
+    "format:write": "prettier --write \"**/*.js\"",
+    "format:check": "prettier --check \"**/*.js\"",
     "lint": "npx eslint . -c ./.github/linters/.eslintrc.yml",
     "package": "ncc build src/index.js --license licenses.txt",
     "package:watch": "npm run package -- --watch",
-    "test": "jest && make-coverage-badge --output-path ./badges/coverage.svg",
+    "test": "jest",
     "all": "npm run format:write && npm run lint && npm run test && npm run package"
   },
   "license": "MIT",
@@ -28,6 +28,7 @@
     "verbose": true,
     "clearMocks": true,
     "testEnvironment": "node",
+    "transform": {},
     "moduleFileExtensions": [
       "js"
     ],
@@ -53,16 +54,15 @@
     "@actions/exec": "^1.1.1"
   },
   "devDependencies": {
-    "@babel/core": "^7.29.13",
-    "@babel/eslint-parser": "^7.29.13",
-    "@babel/preset-env": "^7.29.14",
     "@vercel/ncc": "^0.38.1",
-    "babel-preset-jest": "^29.6.3",
     "eslint": "^8.57.1",
     "eslint-plugin-github": "^4.10.1",
     "eslint-plugin-jest": "^27.9.0",
     "jest": "^30.5.2",
-    "make-coverage-badge": "^1.2.0",
     "prettier": "^3.10.1"
+  },
+  "overrides": {
+    "glob": "^14.0.2",
+    "minimatch": "^11.0.1"
   }
 }

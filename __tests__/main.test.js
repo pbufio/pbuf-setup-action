@@ -14,20 +14,25 @@ const errorMock = jest.spyOn(core, 'error').mockImplementation()
 const infoMock = jest.spyOn(core, 'info').mockImplementation()
 const warningMock = jest.spyOn(core, 'warning').mockImplementation()
 const getInputMock = jest.spyOn(core, 'getInput').mockImplementation()
+const getStateMock = jest.spyOn(core, 'getState').mockImplementation(() => '')
+const saveStateMock = jest.spyOn(core, 'saveState').mockImplementation()
 const setFailedMock = jest.spyOn(core, 'setFailed').mockImplementation()
 const setOutputMock = jest.spyOn(core, 'setOutput').mockImplementation()
 const setSecretMock = jest.spyOn(core, 'setSecret').mockImplementation()
 const exportVarMock = jest.spyOn(core, 'exportVariable').mockImplementation()
 const execMock = jest.spyOn(exec, 'exec').mockImplementation()
+const homedirMock = jest.spyOn(os, 'homedir')
 
 describe('action', () => {
   const originalEnv = process.env
   const { osName, archName } = main.resolvePlatform()
   let tempDir
   let toolCacheDir
+  let fakeHome
 
   beforeEach(() => {
     jest.clearAllMocks()
+    getStateMock.mockReturnValue('')
     process.env = { ...originalEnv }
     delete process.env.GITHUB_EVENT_PATH
     delete process.env.GITHUB_REPOSITORY
@@ -36,6 +41,10 @@ describe('action', () => {
     delete process.env.GITHUB_API_URL
     delete process.env.GITHUB_WORKSPACE
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-action-test-'))
+    fakeHome = path.join(tempDir, 'home')
+    fs.mkdirSync(fakeHome, { recursive: true })
+    homedirMock.mockReturnValue(fakeHome)
+    process.env.RUNNER_TEMP = path.join(tempDir, 'runner-temp')
     toolCacheDir = path.join(tempDir, 'tool-cache')
     process.env.RUNNER_TOOL_CACHE = toolCacheDir
     const cachedDir = path.join(toolCacheDir, 'pbuf', '0.19.0', archName)
@@ -310,9 +319,6 @@ describe('action', () => {
 
   it('falls back to $HOME/.local/bin when RUNNER_TOOL_CACHE is unset', async () => {
     delete process.env.RUNNER_TOOL_CACHE
-    const fakeHome = path.join(tempDir, 'home')
-    fs.mkdirSync(fakeHome, { recursive: true })
-    const homedirSpy = jest.spyOn(os, 'homedir').mockReturnValue(fakeHome)
 
     const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fakeArchive = Buffer.from('rootless-tar')
@@ -356,7 +362,6 @@ describe('action', () => {
     )
 
     fetchMock.mockRestore()
-    homedirSpy.mockRestore()
   })
 
   it.each([
@@ -1002,5 +1007,197 @@ describe('action', () => {
     expect(setFailedMock).toHaveBeenCalledWith(
       'pbuf lint failed with exit code 137'
     )
+  })
+
+  it('backs up pre-existing ~/.netrc before auth and restores or deletes it in post hook', async () => {
+    const netrcPath = path.join(fakeHome, '.netrc')
+    fs.writeFileSync(netrcPath, 'machine github.com login git password tok\n', {
+      mode: 0o600
+    })
+
+    const savedState = {}
+    saveStateMock.mockImplementation((key, val) => {
+      savedState[key] = val
+    })
+    getStateMock.mockImplementation(key => savedState[key] || '')
+
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.19.0'
+      if (name === 'pbuf_token') return 'pbuf_secret_tok'
+      return ''
+    })
+
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'pbuf' && args[0] === 'auth') {
+        fs.writeFileSync(
+          netrcPath,
+          'machine pbuf.cloud login user password pbuf_secret_tok\n'
+        )
+      }
+      return 0
+    })
+
+    await main.run()
+    expect(savedState.isPost).toBe('true')
+    expect(savedState.netrcMode).toBe('restore')
+    expect(fs.existsSync(savedState.netrcBackupPath)).toBe(true)
+
+    // Run post-job cleanup -> restores original ~/.netrc and removes backup
+    await main.run()
+    expect(fs.readFileSync(netrcPath, 'utf8')).toBe(
+      'machine github.com login git password tok\n'
+    )
+    expect(fs.existsSync(savedState.netrcBackupPath)).toBe(false)
+
+    // Fresh run without prior ~/.netrc -> post-job deletes ~/.netrc
+    fs.rmSync(netrcPath, { force: true })
+    for (const key of Object.keys(savedState)) {
+      delete savedState[key]
+    }
+    await main.run()
+    expect(savedState.netrcMode).toBe('delete')
+    expect(fs.existsSync(netrcPath)).toBe(true)
+
+    await main.run()
+    expect(fs.existsSync(netrcPath)).toBe(false)
+
+    // Symlinked ~/.netrc -> target stays untouched and symlink is restored in post
+    const dotfileNetrc = path.join(tempDir, 'dotfiles-netrc')
+    fs.writeFileSync(
+      dotfileNetrc,
+      'machine corp.internal login ci password keepme\n',
+      { mode: 0o600 }
+    )
+    fs.symlinkSync(dotfileNetrc, netrcPath)
+    for (const key of Object.keys(savedState)) {
+      delete savedState[key]
+    }
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'pbuf' && args[0] === 'auth') {
+        fs.appendFileSync(
+          netrcPath,
+          'machine pbuf.cloud login user password pbuf_secret_tok\n'
+        )
+      }
+      return 0
+    })
+
+    await main.run()
+    expect(savedState.netrcMode).toBe('symlink')
+    expect(fs.lstatSync(netrcPath).isSymbolicLink()).toBe(false)
+    expect(fs.readFileSync(dotfileNetrc, 'utf8')).toBe(
+      'machine corp.internal login ci password keepme\n'
+    )
+
+    await main.run()
+    expect(fs.lstatSync(netrcPath).isSymbolicLink()).toBe(true)
+    expect(fs.readlinkSync(netrcPath)).toBe(dotfileNetrc)
+    expect(fs.readFileSync(dotfileNetrc, 'utf8')).toBe(
+      'machine corp.internal login ci password keepme\n'
+    )
+  })
+
+  it('retries transient 503/429, network errors, and mid-stream body drops in fetchWithRetry', async () => {
+    const cancelMock = jest.fn().mockResolvedValue()
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => {
+          throw new Error('mid-stream reset')
+        }
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        body: { cancel: cancelMock }
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () => 'ok-body'
+      })
+
+    const { res, bodyData } = await main.fetchWithRetry(
+      'https://example.com',
+      {},
+      5000,
+      4,
+      0,
+      r => r.text()
+    )
+    expect(res.status).toBe(200)
+    expect(bodyData).toBe('ok-body')
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(cancelMock).toHaveBeenCalledTimes(1)
+    fetchMock.mockRestore()
+  })
+
+  it('rejects invalid boolean inputs, handles non-PR/issue_comment events, truncates at newline, and validates platform/JSON errors', async () => {
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.19.0'
+      if (name === 'drift_diff') return 'yes'
+      return ''
+    })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid boolean input drift_diff="yes" (expected true or false)'
+    )
+
+    expect(() => main.resolvePlatform('win32', 'x64')).toThrow(
+      'Unsupported operating system "win32"'
+    )
+    expect(() => main.resolvePlatform('linux', 'ia32')).toThrow(
+      'Unsupported architecture "ia32"'
+    )
+    expect(() =>
+      main.parseExpectedChecksum('deadbeef  other.tar.gz\n', 'missing.tar.gz')
+    ).toThrow('Checksum entry for missing.tar.gz not found')
+
+    const tableMarkdown = `${'row-line\n'.repeat(6665)}trailing-cut-row`
+    const truncated = main.truncateMarkdown(tableMarkdown)
+    expect(truncated).toContain('_...report truncated..._')
+    expect(truncated).not.toContain('trailing-cut-row')
+
+    // Non-PR push event skips comment cleanly
+    jest.clearAllMocks()
+    getStateMock.mockReturnValue('')
+    const eventFile = path.join(tempDir, 'push-event.json')
+    fs.writeFileSync(eventFile, JSON.stringify({ ref: 'refs/heads/main' }))
+    process.env.GITHUB_EVENT_PATH = eventFile
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'lint':
+          return 'true'
+        case 'drift_diff':
+          return 'true'
+        case 'comment_on_pr':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(Buffer.from('not-json'))
+        return 1
+      }
+      if (cmd === 'pbuf' && args[0] === 'drift') {
+        options.listeners.stdout(
+          Buffer.from('### Schema Drift Diff: `acme/orders`\n')
+        )
+        return 0
+      }
+      return 0
+    })
+    await main.run()
+    expect(infoMock).toHaveBeenCalledWith(
+      'Skipping PR comment: workflow event is not a pull request'
+    )
+    expect(setFailedMock).toHaveBeenCalledWith('not-json')
   })
 })

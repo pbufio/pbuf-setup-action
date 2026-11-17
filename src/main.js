@@ -18,7 +18,9 @@ const VALID_FAIL_ON = new Set(['critical', 'warning', 'info', 'none'])
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const COMMENT_MARKER = '<!-- pbuf-drift-diff -->'
 const MAX_COMMENT_CHARS = 60000
+const MAX_COMMENT_PAGES = 25
 const MAX_LINT_ANNOTATIONS = 50
+const DEFAULT_RETRY_DELAY_MS = process.env.NODE_ENV === 'test' ? 0 : 250
 const CLI_FATAL_TRAILER_RE =
   /(?:^|\r?\n)(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*([\s\S]*)$/
 const CLI_FATAL_PREFIX_RE =
@@ -110,19 +112,91 @@ function parseDriftCliOutput(rawStdout, rawStderr, exitCode) {
   return { markdown: cleanedStdout, errorMessage: cleanedStderr }
 }
 
+function parseBooleanInput(name) {
+  const raw = core.getInput(name).trim()
+  const normalized = raw.toLowerCase()
+  if (normalized === '' || normalized === 'false') {
+    return false
+  }
+  if (normalized === 'true') {
+    return true
+  }
+  throw new Error(
+    `Invalid boolean input ${name}="${raw}" (expected true or false)`
+  )
+}
+
+async function fetchWithRetry(
+  url,
+  options = {},
+  timeoutMs = 15000,
+  attempts = 3,
+  baseDelayMs = DEFAULT_RETRY_DELAY_MS,
+  readBody = null
+) {
+  let lastError
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(timeoutMs)
+      })
+      if (attempt < attempts && (res.status === 429 || res.status >= 500)) {
+        if (res.body && typeof res.body.cancel === 'function') {
+          try {
+            await res.body.cancel()
+          } catch {
+            // ignore body cancel errors before retry
+          }
+        }
+      } else {
+        const bodyData =
+          res.ok && typeof readBody === 'function'
+            ? await readBody(res)
+            : undefined
+        return readBody ? { res, bodyData } : res
+      }
+    } catch (error) {
+      lastError = error
+      if (attempt >= attempts) {
+        throw error
+      }
+    }
+    if (baseDelayMs > 0) {
+      await new Promise(resolve =>
+        setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1))
+      )
+    }
+  }
+  throw lastError
+}
+
+function truncateMarkdown(markdown) {
+  if (markdown.length <= MAX_COMMENT_CHARS) {
+    return markdown
+  }
+  const lastNewline = markdown.lastIndexOf('\n', MAX_COMMENT_CHARS)
+  const cutIndex =
+    lastNewline >= MAX_COMMENT_CHARS - 2000 ? lastNewline : MAX_COMMENT_CHARS
+  const prefix = markdown.slice(0, cutIndex)
+  const safePrefix =
+    typeof prefix.toWellFormed === 'function' ? prefix.toWellFormed() : prefix
+  return `${safePrefix}\n\n_...report truncated..._`
+}
+
 function getPullRequestNumber() {
   const eventPath = process.env.GITHUB_EVENT_PATH
   if (!eventPath || !fs.existsSync(eventPath)) {
     return null
   }
   const event = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
-  if (event.pull_request && event.pull_request.number) {
-    return event.pull_request.number
-  }
-  if (event.issue && event.issue.pull_request && event.issue.number) {
-    return event.issue.number
-  }
-  return null
+  const candidate =
+    event.pull_request && event.pull_request.number
+      ? event.pull_request.number
+      : event.issue && event.issue.pull_request && event.issue.number
+        ? event.issue.number
+        : null
+  return Number.isInteger(candidate) && candidate > 0 ? candidate : null
 }
 
 async function upsertPullRequestComment(
@@ -149,10 +223,7 @@ async function upsertPullRequestComment(
     }
 
     const marker = buildCommentMarker(workingDirectory)
-    const truncated =
-      markdown.length > MAX_COMMENT_CHARS
-        ? `${markdown.slice(0, MAX_COMMENT_CHARS)}\n\n_...report truncated..._`
-        : markdown
+    const truncated = truncateMarkdown(markdown)
     const body = `${marker}\n${truncated}`
     const apiBase = (
       process.env.GITHUB_API_URL || 'https://api.github.com'
@@ -166,13 +237,16 @@ async function upsertPullRequestComment(
     }
 
     let existingId = null
-    for (let page = 1; page <= 5; page += 1) {
+    for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
       const listUrl = `${apiBase}/repos/${repository}/issues/${prNumber}/comments?per_page=100&page=${page}`
-      const listRes = await fetch(listUrl, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(10000)
-      })
+      const listRes = await fetchWithRetry(
+        listUrl,
+        {
+          method: 'GET',
+          headers
+        },
+        10000
+      )
       if (!listRes.ok) {
         throw new Error(`GET comments failed with status ${listRes.status}`)
       }
@@ -199,12 +273,15 @@ async function upsertPullRequestComment(
 
     if (existingId) {
       const patchUrl = `${apiBase}/repos/${repository}/issues/comments/${existingId}`
-      const patchRes = await fetch(patchUrl, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify({ body }),
-        signal: AbortSignal.timeout(10000)
-      })
+      const patchRes = await fetchWithRetry(
+        patchUrl,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ body })
+        },
+        10000
+      )
       if (!patchRes.ok) {
         throw new Error(`PATCH comment failed with status ${patchRes.status}`)
       }
@@ -215,12 +292,16 @@ async function upsertPullRequestComment(
     }
 
     const createUrl = `${apiBase}/repos/${repository}/issues/${prNumber}/comments`
-    const createRes = await fetch(createUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ body }),
-      signal: AbortSignal.timeout(10000)
-    })
+    const createRes = await fetchWithRetry(
+      createUrl,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ body })
+      },
+      10000,
+      1
+    )
     if (!createRes.ok) {
       throw new Error(`POST comment failed with status ${createRes.status}`)
     }
@@ -270,19 +351,25 @@ async function resolveReleaseTag(version, githubToken) {
   const useAuth =
     githubToken !== '' && configuredApi === 'https://api.github.com'
 
-  let res = await fetch(RELEASE_API_URL, {
-    method: 'GET',
-    headers: useAuth
-      ? { ...baseHeaders, Authorization: `Bearer ${githubToken}` }
-      : baseHeaders,
-    signal: AbortSignal.timeout(15000)
-  })
-  if ((res.status === 401 || res.status === 403) && useAuth) {
-    res = await fetch(RELEASE_API_URL, {
+  let res = await fetchWithRetry(
+    RELEASE_API_URL,
+    {
       method: 'GET',
-      headers: baseHeaders,
-      signal: AbortSignal.timeout(15000)
-    })
+      headers: useAuth
+        ? { ...baseHeaders, Authorization: `Bearer ${githubToken}` }
+        : baseHeaders
+    },
+    15000
+  )
+  if ((res.status === 401 || res.status === 403) && useAuth) {
+    res = await fetchWithRetry(
+      RELEASE_API_URL,
+      {
+        method: 'GET',
+        headers: baseHeaders
+      },
+      15000
+    )
   }
   if (!res.ok) {
     throw new Error(
@@ -398,10 +485,16 @@ async function installPbufCli(version, githubToken) {
     const archiveUrl = `${RELEASE_DOWNLOAD_BASE}/${tag}/${archiveName}`
 
     core.info(`Downloading ${archiveName} (${tag}) and verifying SHA-256...`)
-    const [checksumsRes, archiveRes] = await Promise.all([
-      fetch(checksumsUrl, { signal: AbortSignal.timeout(30000) }),
-      fetch(archiveUrl, { signal: AbortSignal.timeout(60000) })
+    const [checksumsDownload, archiveDownload] = await Promise.all([
+      fetchWithRetry(checksumsUrl, {}, 30000, 3, DEFAULT_RETRY_DELAY_MS, res =>
+        res.text()
+      ),
+      fetchWithRetry(archiveUrl, {}, 60000, 3, DEFAULT_RETRY_DELAY_MS, res =>
+        res.arrayBuffer()
+      )
     ])
+    const { res: checksumsRes, bodyData: checksumsText } = checksumsDownload
+    const { res: archiveRes, bodyData: archiveArrayBuffer } = archiveDownload
     if (!checksumsRes.ok) {
       throw new Error(
         `Failed to download checksums.txt for ${tag} (status ${checksumsRes.status})`
@@ -413,9 +506,8 @@ async function installPbufCli(version, githubToken) {
       )
     }
 
-    const checksumsText = await checksumsRes.text()
     const expectedHash = parseExpectedChecksum(checksumsText, archiveName)
-    const archiveBuffer = Buffer.from(await archiveRes.arrayBuffer())
+    const archiveBuffer = Buffer.from(archiveArrayBuffer)
     const actualHash = crypto
       .createHash('sha256')
       .update(archiveBuffer)
@@ -463,6 +555,106 @@ async function installPbufCli(version, githubToken) {
   return plainVersion
 }
 
+async function execPbuf(args, workingDirectory = '') {
+  const stdoutChunks = []
+  const stderrChunks = []
+  const exitCode = await exec.exec('pbuf', args, {
+    cwd: workingDirectory || undefined,
+    ignoreReturnCode: true,
+    silent: true,
+    listeners: {
+      stdout: data => {
+        stdoutChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+      },
+      stderr: data => {
+        stderrChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+      }
+    }
+  })
+  return {
+    exitCode,
+    stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+    stderr: Buffer.concat(stderrChunks).toString('utf8')
+  }
+}
+
+function backupNetrcBeforeAuth() {
+  const netrcPath = path.join(os.homedir(), '.netrc')
+  const stat = fs.lstatSync(netrcPath, { throwIfNoEntry: false })
+  if (stat && stat.isSymbolicLink()) {
+    const target = fs.readlinkSync(netrcPath)
+    let existingBytes = null
+    if (fs.existsSync(netrcPath) && fs.statSync(netrcPath).isFile()) {
+      existingBytes = fs.readFileSync(netrcPath)
+    }
+    fs.unlinkSync(netrcPath)
+    if (existingBytes !== null) {
+      fs.writeFileSync(netrcPath, existingBytes, { mode: 0o600, flag: 'wx' })
+    }
+    core.saveState('netrcMode', 'symlink')
+    core.saveState('netrcSymlinkTarget', target)
+  } else if (stat && stat.isFile()) {
+    const tempRoot = (process.env.RUNNER_TEMP || '').trim() || os.tmpdir()
+    fs.mkdirSync(tempRoot, { recursive: true })
+    const backupPath = path.join(
+      tempRoot,
+      `.pbuf-netrc-backup.${process.pid}.${crypto.randomBytes(8).toString('hex')}`
+    )
+    fs.writeFileSync(backupPath, fs.readFileSync(netrcPath), {
+      mode: 0o600,
+      flag: 'wx'
+    })
+    core.saveState('netrcMode', 'restore')
+    core.saveState('netrcBackupPath', backupPath)
+  } else {
+    core.saveState('netrcMode', 'delete')
+  }
+}
+
+function cleanupPost() {
+  const mode = core.getState('netrcMode')
+  if (!mode) {
+    return
+  }
+  const netrcPath = path.join(os.homedir(), '.netrc')
+  const backupPath = core.getState('netrcBackupPath')
+  const symlinkTarget = core.getState('netrcSymlinkTarget')
+  let staged = ''
+  try {
+    const suffix = `${process.pid}.${crypto.randomBytes(4).toString('hex')}`
+    if (mode === 'symlink' && symlinkTarget) {
+      staged = `${netrcPath}.restore.${suffix}`
+      fs.symlinkSync(symlinkTarget, staged)
+      fs.renameSync(staged, netrcPath)
+      staged = ''
+      core.info('Restored pre-existing ~/.netrc symlink after job')
+    } else if (mode === 'restore' && backupPath && fs.existsSync(backupPath)) {
+      staged = `${netrcPath}.restore.${suffix}`
+      fs.writeFileSync(staged, fs.readFileSync(backupPath), {
+        mode: 0o600,
+        flag: 'wx'
+      })
+      fs.renameSync(staged, netrcPath)
+      staged = ''
+      core.info('Restored pre-existing ~/.netrc after job')
+    } else if (mode === 'delete' || mode === 'restore' || mode === 'symlink') {
+      fs.rmSync(netrcPath, { force: true })
+      core.info('Removed temporary ~/.netrc credentials')
+    }
+  } catch (error) {
+    core.warning(
+      `Failed to clean up ~/.netrc (${error instanceof Error ? error.message : String(error)})`
+    )
+  } finally {
+    if (staged) {
+      fs.rmSync(staged, { force: true })
+    }
+    if (backupPath) {
+      fs.rmSync(backupPath, { force: true })
+    }
+  }
+}
+
 async function runLint(workingDirectory, plainVersion) {
   if (!supportsLint(plainVersion)) {
     core.setFailed(
@@ -483,23 +675,7 @@ async function runLint(workingDirectory, plainVersion) {
       ? ['lint', '-o', 'json', '--', ...paths]
       : ['lint', '-o', 'json']
 
-  const stdoutChunks = []
-  const stderrChunks = []
-  const exitCode = await exec.exec('pbuf', args, {
-    cwd: workingDirectory || undefined,
-    ignoreReturnCode: true,
-    silent: true,
-    listeners: {
-      stdout: data => {
-        stdoutChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
-      },
-      stderr: data => {
-        stderrChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
-      }
-    }
-  })
-  const stdout = Buffer.concat(stdoutChunks).toString('utf8')
-  const stderr = Buffer.concat(stderrChunks).toString('utf8')
+  const { exitCode, stdout, stderr } = await execPbuf(args, workingDirectory)
 
   core.setOutput('lint_exit_code', String(exitCode))
 
@@ -582,7 +758,7 @@ async function runLint(workingDirectory, plainVersion) {
   core.setFailed(errorMessage || `pbuf lint failed with exit code ${exitCode}`)
 }
 
-async function runDriftDiff(workingDirectory, githubToken) {
+async function runDriftDiff(workingDirectory, githubToken, commentOnPr) {
   const failOn = (core.getInput('fail_on').trim() || 'critical').toLowerCase()
   if (!VALID_FAIL_ON.has(failOn)) {
     core.setFailed(
@@ -592,28 +768,13 @@ async function runDriftDiff(workingDirectory, githubToken) {
   }
 
   const against = core.getInput('against').trim()
-  const commentOnPr =
-    core.getInput('comment_on_pr').trim().toLowerCase() === 'true'
 
   const args = ['drift', 'diff', '--format=markdown', `--fail-on=${failOn}`]
   if (against !== '') {
     args.push(`--against=${against}`)
   }
 
-  let stdout = ''
-  let stderr = ''
-  const exitCode = await exec.exec('pbuf', args, {
-    cwd: workingDirectory || undefined,
-    ignoreReturnCode: true,
-    listeners: {
-      stdout: data => {
-        stdout += data.toString()
-      },
-      stderr: data => {
-        stderr += data.toString()
-      }
-    }
-  })
+  const { exitCode, stdout, stderr } = await execPbuf(args, workingDirectory)
 
   const { markdown, errorMessage } = parseDriftCliOutput(
     stdout,
@@ -628,6 +789,11 @@ async function runDriftDiff(workingDirectory, githubToken) {
       errorMessage || `pbuf drift diff failed with exit code ${exitCode}`
     )
     return
+  }
+
+  core.info(`pbuf drift diff completed (exit code ${exitCode}).`)
+  if (markdown !== '') {
+    core.info(markdown.replace(/(^|\r?\n)(\s*)::/g, '$1$2: :'))
   }
 
   if (markdown !== '' && process.env.GITHUB_STEP_SUMMARY) {
@@ -647,11 +813,19 @@ async function runDriftDiff(workingDirectory, githubToken) {
 
 async function run() {
   try {
+    if (core.getState('isPost') === 'true') {
+      cleanupPost()
+      return
+    }
+    core.saveState('isPost', 'true')
+
     const version = core.getInput('version').trim()
     const pbufToken = core.getInput('pbuf_token')
     const registryUrl = core.getInput('registry_url').trim()
-    const registryInsecure =
-      core.getInput('registry_insecure').trim().toLowerCase() === 'true'
+    const registryInsecure = parseBooleanInput('registry_insecure')
+    const lintEnabled = parseBooleanInput('lint')
+    const driftDiffEnabled = parseBooleanInput('drift_diff')
+    const commentOnPr = parseBooleanInput('comment_on_pr')
     const workingDirectory = core.getInput('working_directory').trim()
     const githubToken =
       core.getInput('github_token') || process.env.GITHUB_TOKEN || ''
@@ -695,6 +869,7 @@ async function run() {
 
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
+      backupNetrcBeforeAuth()
       await exec.exec('pbuf', ['auth', '--', pbufToken], {
         cwd: workingDirectory || undefined,
         silent: true
@@ -703,12 +878,12 @@ async function run() {
 
     core.info('Successfully setup pbuf cli')
 
-    if (core.getInput('lint').trim().toLowerCase() === 'true') {
+    if (lintEnabled) {
       await runLint(workingDirectory, plainVersion)
     }
 
-    if (core.getInput('drift_diff').trim().toLowerCase() === 'true') {
-      await runDriftDiff(workingDirectory, githubToken)
+    if (driftDiffEnabled) {
+      await runDriftDiff(workingDirectory, githubToken, commentOnPr)
     }
   } catch (error) {
     core.setFailed(error instanceof Error ? error.message : String(error))
@@ -718,12 +893,15 @@ async function run() {
 module.exports = {
   COMMENT_MARKER,
   buildCommentMarker,
+  fetchWithRetry,
   normalizeRegistryAddr,
+  parseBooleanInput,
   parseDriftCliOutput,
   parseExpectedChecksum,
   parseLintPaths,
   resolveAnnotationFile,
   resolvePlatform,
   run,
-  supportsLint
+  supportsLint,
+  truncateMarkdown
 }
