@@ -52,19 +52,24 @@ jobs:
         id: checkout
         uses: actions/checkout@v7
 
-      - name: Test Local Action (Pinned Version)
+      - name: Test Local Action (Default Version)
         id: test-action
         uses: ./
-        with:
-          version: v0.17.1
 
       - name: Check pbuf CLI
         id: check-pbuf-cli
         run: |
-          pbuf --version | grep "v0.17.1"
-          mkdir -p /tmp/pbuf-smoke && cd /tmp/pbuf-smoke
+          pbuf --version | grep "v0.19.0"
+          mkdir -p /tmp/pbuf-smoke/api && cd /tmp/pbuf-smoke
           pbuf init pbufio/pbuf-setup-action
           test -f pbuf.yaml
+          cat <<'EOF' > /tmp/pbuf-smoke/api/hello.proto
+          syntax = "proto3";
+          package smoke.v1;
+          message HelloRequest {
+            string user_id = 1;
+          }
+          EOF
 
       - name: Test Local Action With Auth Token (Latest)
         id: test-action-with-config
@@ -77,3 +82,13 @@ jobs:
       - name: Check .netrc
         id: check-netrc
         run: grep -q "machine registry.internal" ~/.netrc
+
+      - name: Test Local Action Offline Lint
+        id: test-lint
+        uses: ./
+        with:
+          lint: true
+          working_directory: /tmp/pbuf-smoke
+
+      - name: Verify Lint Output
+        run: test "${{ steps.test-lint.outputs.lint_exit_code }}" = "0"
