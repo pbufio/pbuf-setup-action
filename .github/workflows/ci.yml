@@ -43,9 +43,26 @@ jobs:
         id: npm-ci-test
         run: npm run ci-test
 
+      - name: Verify dist/ Bundle
+        id: verify-dist
+        run: |
+          npm run package
+          if [ -n "$(git status --porcelain dist/)" ]; then
+            echo "Detected uncommitted or untracked changes in dist/:"
+            git status --short dist/
+            git diff --ignore-space-at-eol --text dist/
+            exit 1
+          fi
+
   test-action:
-    name: GitHub Actions Test
-    runs-on: ubuntu-latest
+    name: GitHub Actions Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
 
     steps:
       - name: Checkout
@@ -60,10 +77,11 @@ jobs:
         id: check-pbuf-cli
         run: |
           pbuf --version | grep "v0.19.0"
-          mkdir -p /tmp/pbuf-smoke/api && cd /tmp/pbuf-smoke
+          SMOKE_DIR="${RUNNER_TEMP}/pbuf-smoke"
+          mkdir -p "${SMOKE_DIR}/api" && cd "${SMOKE_DIR}"
           pbuf init pbufio/pbuf-setup-action
           test -f pbuf.yaml
-          cat <<'EOF' > /tmp/pbuf-smoke/api/hello.proto
+          cat <<'EOF' > "${SMOKE_DIR}/api/hello.proto"
           syntax = "proto3";
           package smoke.v1;
           message HelloRequest {
@@ -88,7 +106,7 @@ jobs:
         uses: ./
         with:
           lint: true
-          working_directory: /tmp/pbuf-smoke
+          working_directory: ${{ runner.temp }}/pbuf-smoke
 
       - name: Verify Lint Output
         run: test "${{ steps.test-lint.outputs.lint_exit_code }}" = "0"
