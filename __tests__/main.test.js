@@ -10,6 +10,7 @@ const exec = require('@actions/exec')
 const main = require('../src/main')
 
 const addPathMock = jest.spyOn(core, 'addPath').mockImplementation()
+const errorMock = jest.spyOn(core, 'error').mockImplementation()
 const infoMock = jest.spyOn(core, 'info').mockImplementation()
 const warningMock = jest.spyOn(core, 'warning').mockImplementation()
 const getInputMock = jest.spyOn(core, 'getInput').mockImplementation()
@@ -33,10 +34,11 @@ describe('action', () => {
     delete process.env.GITHUB_STEP_SUMMARY
     delete process.env.GITHUB_TOKEN
     delete process.env.GITHUB_API_URL
+    delete process.env.GITHUB_WORKSPACE
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-action-test-'))
     toolCacheDir = path.join(tempDir, 'tool-cache')
     process.env.RUNNER_TOOL_CACHE = toolCacheDir
-    const cachedDir = path.join(toolCacheDir, 'pbuf', '0.17.1', archName)
+    const cachedDir = path.join(toolCacheDir, 'pbuf', '0.19.0', archName)
     fs.mkdirSync(cachedDir, { recursive: true })
     fs.writeFileSync(path.join(cachedDir, 'pbuf'), '#!/bin/sh\n', {
       mode: 0o755
@@ -51,7 +53,7 @@ describe('action', () => {
 
   it('downloads pinned CLI tarball, verifies SHA-256 checksum, caches binary, and authenticates in working_directory', async () => {
     fs.rmSync(toolCacheDir, { recursive: true, force: true })
-    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fakeArchive = Buffer.from('fake-tar-gz-bytes')
     const archiveSha = crypto
       .createHash('sha256')
@@ -82,7 +84,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'pbuf_token':
           return 'pbuf_token_test'
         case 'registry_url':
@@ -101,7 +103,7 @@ describe('action', () => {
     const expectedInstallDir = path.join(
       toolCacheDir,
       'pbuf',
-      '0.17.1',
+      '0.19.0',
       archName
     )
     const expectedBin = path.join(expectedInstallDir, 'pbuf')
@@ -112,7 +114,7 @@ describe('action', () => {
     )
     expect(exportVarMock).toHaveBeenCalledWith('PBUF_REGISTRY_INSECURE', 'true')
     expect(setSecretMock).toHaveBeenCalledWith('pbuf_token_test')
-    expect(infoMock).toHaveBeenCalledWith('Installing pbuf cli version v0.17.1')
+    expect(infoMock).toHaveBeenCalledWith('Installing pbuf cli version v0.19.0')
     expect(fs.existsSync(expectedBin)).toBe(true)
     expect(addPathMock).toHaveBeenCalledWith(expectedInstallDir)
     expect(execMock).toHaveBeenCalledWith(expectedBin, ['--version'])
@@ -132,7 +134,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'registry_url':
           return 'bad host/path;rm'
         default:
@@ -158,7 +160,7 @@ describe('action', () => {
     const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: async () => ({ tag_name: 'v0.17.1' })
+      json: async () => ({ tag_name: 'v0.19.0' })
     })
 
     await main.run()
@@ -174,7 +176,7 @@ describe('action', () => {
       })
     )
     expect(infoMock).toHaveBeenCalledWith(
-      expect.stringContaining('Reusing cached pbuf v0.17.1')
+      expect.stringContaining('Reusing cached pbuf v0.19.0')
     )
 
     fetchMock.mockRestore()
@@ -235,7 +237,7 @@ describe('action', () => {
 
   it('rejects symlink pbuf entries extracted from release archive', async () => {
     fs.rmSync(toolCacheDir, { recursive: true, force: true })
-    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fakeArchive = Buffer.from('symlink-tar')
     const archiveSha = crypto
       .createHash('sha256')
@@ -264,7 +266,7 @@ describe('action', () => {
     })
 
     getInputMock.mockImplementation(name =>
-      name === 'version' ? 'v0.17.1' : ''
+      name === 'version' ? 'v0.19.0' : ''
     )
 
     await main.run()
@@ -278,7 +280,7 @@ describe('action', () => {
 
   it('fails installation when SHA-256 checksum does not match checksums.txt', async () => {
     fs.rmSync(toolCacheDir, { recursive: true, force: true })
-    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fetchMock = jest
       .spyOn(global, 'fetch')
       .mockResolvedValueOnce({
@@ -293,7 +295,7 @@ describe('action', () => {
       })
 
     getInputMock.mockImplementation(name =>
-      name === 'version' ? '0.17.1' : ''
+      name === 'version' ? '0.19.0' : ''
     )
 
     await main.run()
@@ -312,7 +314,7 @@ describe('action', () => {
     fs.mkdirSync(fakeHome, { recursive: true })
     const homedirSpy = jest.spyOn(os, 'homedir').mockReturnValue(fakeHome)
 
-    const archiveName = `pbuf_0.17.1_${osName}_${archName}.tar.gz`
+    const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fakeArchive = Buffer.from('rootless-tar')
     const archiveSha = crypto
       .createHash('sha256')
@@ -341,7 +343,7 @@ describe('action', () => {
     })
 
     getInputMock.mockImplementation(name =>
-      name === 'version' ? 'v0.17.1' : ''
+      name === 'version' ? 'v0.19.0' : ''
     )
 
     await main.run()
@@ -392,7 +394,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'drift_diff':
           return 'true'
         case 'fail_on':
@@ -470,7 +472,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'drift_diff':
           return 'true'
         case 'comment_on_pr':
@@ -517,7 +519,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'drift_diff':
           return 'true'
         case 'working_directory':
@@ -594,7 +596,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'drift_diff':
           return 'true'
         case 'comment_on_pr':
@@ -633,7 +635,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'drift_diff':
           return 'true'
         case 'fail_on':
@@ -712,7 +714,7 @@ describe('action', () => {
     getInputMock.mockImplementation(name => {
       switch (name) {
         case 'version':
-          return 'v0.17.1'
+          return 'v0.19.0'
         case 'registry_insecure':
           return 'true'
         case 'drift_diff':
@@ -758,5 +760,247 @@ describe('action', () => {
       expect.objectContaining({ method: 'PATCH' })
     )
     fetchMock.mockRestore()
+  })
+
+  it('runs offline pbuf lint with quoted/multiline lint_paths and sets lint_exit_code=0', async () => {
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'lint':
+          return 'true'
+        case 'lint_paths':
+          return 'api\n"my service"/proto \'third/dir\' ""'
+        default:
+          return ''
+      }
+    })
+
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(
+          Buffer.from(JSON.stringify({ files: 4, findings: [] }))
+        )
+        return 0
+      }
+      return 0
+    })
+
+    await main.run()
+
+    expect(execMock).toHaveBeenCalledWith(
+      'pbuf',
+      ['lint', '-o', 'json', '--', 'api', 'my service/proto', 'third/dir'],
+      expect.objectContaining({
+        cwd: undefined,
+        ignoreReturnCode: true,
+        silent: true
+      })
+    )
+    expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '0')
+    expect(infoMock).toHaveBeenCalledWith(
+      'pbuf lint passed (4 file(s) checked, 0 violations).'
+    )
+    expect(errorMock).not.toHaveBeenCalled()
+    expect(setFailedMock).not.toHaveBeenCalled()
+  })
+
+  it('emits GitHub PR file annotations for pbuf lint violations, caps at 50, and still runs drift_diff', async () => {
+    process.env.GITHUB_WORKSPACE = '/workspace/repo'
+    const findings = [
+      {
+        filename: 'proto/billing.proto',
+        line: 14,
+        column: 3,
+        rule: 'FIELD_NAME',
+        message: 'field "userId" should be snake_case'
+      },
+      {
+        filename: '../shared/empty.proto',
+        line: 0,
+        column: 0,
+        rule: 'SYNTAX',
+        message: 'file is empty'
+      }
+    ]
+    for (let i = 0; i < 50; i += 1) {
+      findings.push({
+        filename: 'proto/extra.proto',
+        line: i + 1,
+        column: 1,
+        rule: 'MESSAGE_NAME',
+        message: `message bad_${i} should be PascalCase`
+      })
+    }
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'working_directory':
+          return './services/billing/'
+        case 'lint':
+          return 'true'
+        case 'drift_diff':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(
+          Buffer.from(JSON.stringify({ files: 3, findings }))
+        )
+        options.listeners.stderr(
+          Buffer.from(
+            'failed to execute command: lint failed: 52 violation(s) found\n'
+          )
+        )
+        return 1
+      }
+      if (cmd === 'pbuf' && args[0] === 'drift') {
+        options.listeners.stdout(Buffer.from('No schema changes detected.\n'))
+        return 0
+      }
+      return 0
+    })
+
+    await main.run()
+
+    expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
+    expect(errorMock).toHaveBeenCalledTimes(50)
+    expect(errorMock).toHaveBeenNthCalledWith(
+      1,
+      '[FIELD_NAME] field "userId" should be snake_case',
+      {
+        title: 'pbuf lint (FIELD_NAME)',
+        file: 'services/billing/proto/billing.proto',
+        startLine: 14,
+        startColumn: 3
+      }
+    )
+    expect(errorMock).toHaveBeenNthCalledWith(2, '[SYNTAX] file is empty', {
+      title: 'pbuf lint (SYNTAX)',
+      file: 'services/shared/empty.proto'
+    })
+    expect(warningMock).toHaveBeenCalledWith(
+      'Showing first 50 of 52 pbuf lint violations.'
+    )
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'pbuf lint failed: 52 violation(s) found across 3 file(s)'
+    )
+    expect(setOutputMock).toHaveBeenCalledWith('drift_exit_code', '0')
+  })
+
+  it('surfaces clean CLI error when pbuf lint fails before rendering JSON', async () => {
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'lint':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stderr(
+          Buffer.from(
+            'failed to execute command: no .proto files found in api\n'
+          )
+        )
+        return 1
+      }
+      return 0
+    })
+
+    await main.run()
+
+    expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
+    expect(setFailedMock).toHaveBeenCalledWith('no .proto files found in api')
+  })
+
+  it('fails cleanly when lint is enabled with pbuf CLI older than v0.19.0', async () => {
+    const oldDir = path.join(toolCacheDir, 'pbuf', '0.18.0', archName)
+    fs.mkdirSync(oldDir, { recursive: true })
+    fs.writeFileSync(path.join(oldDir, 'pbuf'), '#!/bin/sh\n', { mode: 0o755 })
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.18.0'
+        case 'lint':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+
+    await main.run()
+
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'pbuf lint requires pbuf CLI v0.19.0 or newer (installed v0.18.0)'
+    )
+    expect(execMock).not.toHaveBeenCalledWith(
+      'pbuf',
+      expect.arrayContaining(['lint']),
+      expect.anything()
+    )
+  })
+
+  it('supportsLint, parseLintPaths, and resolveAnnotationFile handle version, quote, chunk, and path edge cases', async () => {
+    expect(main.supportsLint('0.18.0')).toBe(false)
+    expect(main.supportsLint('0.19.0')).toBe(true)
+    expect(main.supportsLint('0.19.0-rc.1')).toBe(true)
+    expect(main.supportsLint('1.0.0')).toBe(true)
+
+    expect(() => main.parseLintPaths('"unclosed/path')).toThrow(
+      'Unclosed quote in lint_paths'
+    )
+
+    process.env.GITHUB_WORKSPACE = '/workspace/repo'
+    expect(main.resolveAnnotationFile('', 'services/a')).toBeUndefined()
+    expect(
+      main.resolveAnnotationFile(
+        '/workspace/repo/api/v1/order.proto',
+        'services/a'
+      )
+    ).toBe('api/v1/order.proto')
+    expect(
+      main.resolveAnnotationFile('api/hello.proto', '/tmp/pbuf-smoke')
+    ).toBe('/tmp/pbuf-smoke/api/hello.proto')
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'lint':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+
+    const utf8Json = Buffer.from(
+      JSON.stringify({ files: 1, findings: [] }),
+      'utf8'
+    )
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(utf8Json.subarray(0, 5))
+        options.listeners.stdout(utf8Json.subarray(5))
+        return 137
+      }
+      return 0
+    })
+
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'pbuf lint failed with exit code 137'
+    )
   })
 })

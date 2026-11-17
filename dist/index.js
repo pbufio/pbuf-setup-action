@@ -3451,8 +3451,11 @@ const VALID_FAIL_ON = new Set(['critical', 'warning', 'info', 'none'])
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const COMMENT_MARKER = '<!-- pbuf-drift-diff -->'
 const MAX_COMMENT_CHARS = 60000
+const MAX_LINT_ANNOTATIONS = 50
 const CLI_FATAL_TRAILER_RE =
   /(?:^|\r?\n)(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*([\s\S]*)$/
+const CLI_FATAL_PREFIX_RE =
+  /^(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*/
 
 function normalizeRegistryAddr(raw) {
   const stripped = raw
@@ -3517,6 +3520,8 @@ function parseDriftCliOutput(rawStdout, rawStderr, exitCode) {
   ).trim()
   let cleanedStderr = rawStderr
     .replace(/(?:^|\r?\n)Usage:\r?\n[\s\S]*$/, '')
+    .trim()
+    .replace(CLI_FATAL_PREFIX_RE, '')
     .trim()
 
   if (exitCode !== 0 && cleanedStdout !== '') {
@@ -3743,6 +3748,67 @@ function smokeCheckArg(plainVersion) {
   return major === 0 && minor < 17 ? '--help' : '--version'
 }
 
+function supportsLint(plainVersion) {
+  const [major, minor] = plainVersion.split('.', 2).map(Number)
+  return major > 0 || minor >= 19
+}
+
+function parseLintPaths(raw) {
+  const paths = []
+  let current = ''
+  let quote = ''
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]
+    if (quote !== '') {
+      if (ch === quote) {
+        quote = ''
+      } else {
+        current += ch
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (/\s/.test(ch)) {
+      if (current !== '') {
+        paths.push(current)
+        current = ''
+      }
+    } else {
+      current += ch
+    }
+  }
+  if (quote !== '') {
+    throw new Error('Unclosed quote in lint_paths')
+  }
+  if (current !== '') {
+    paths.push(current)
+  }
+  return paths
+}
+
+function resolveAnnotationFile(filename, workingDirectory = '') {
+  if (typeof filename !== 'string' || filename.trim() === '') {
+    return undefined
+  }
+  const workspace = (process.env.GITHUB_WORKSPACE || '').trim()
+  const rootDir = workspace ? path.resolve(workspace) : process.cwd()
+  const baseDir = workingDirectory
+    ? path.resolve(rootDir, workingDirectory)
+    : rootDir
+  const absFile = path.isAbsolute(filename)
+    ? path.normalize(filename)
+    : path.resolve(baseDir, filename)
+  const rel = path.relative(rootDir, absFile).replace(/\\/g, '/')
+  if (
+    rel !== '' &&
+    rel !== '..' &&
+    !rel.startsWith('../') &&
+    !path.isAbsolute(rel)
+  ) {
+    return rel
+  }
+  return absFile.replace(/\\/g, '/')
+}
+
 async function installPbufCli(version, githubToken) {
   const { osName, archName } = resolvePlatform()
   const tag = await resolveReleaseTag(version, githubToken)
@@ -3827,6 +3893,126 @@ async function installPbufCli(version, githubToken) {
 
   core.addPath(installDir)
   await exec.exec(destBin, [smokeCheckArg(plainVersion)])
+  return plainVersion
+}
+
+async function runLint(workingDirectory, plainVersion) {
+  if (!supportsLint(plainVersion)) {
+    core.setFailed(
+      `pbuf lint requires pbuf CLI v0.19.0 or newer (installed v${plainVersion})`
+    )
+    return
+  }
+
+  let paths
+  try {
+    paths = parseLintPaths(core.getInput('lint_paths'))
+  } catch (error) {
+    core.setFailed(error instanceof Error ? error.message : String(error))
+    return
+  }
+  const args =
+    paths.length > 0
+      ? ['lint', '-o', 'json', '--', ...paths]
+      : ['lint', '-o', 'json']
+
+  const stdoutChunks = []
+  const stderrChunks = []
+  const exitCode = await exec.exec('pbuf', args, {
+    cwd: workingDirectory || undefined,
+    ignoreReturnCode: true,
+    silent: true,
+    listeners: {
+      stdout: data => {
+        stdoutChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+      },
+      stderr: data => {
+        stderrChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data))
+      }
+    }
+  })
+  const stdout = Buffer.concat(stdoutChunks).toString('utf8')
+  const stderr = Buffer.concat(stderrChunks).toString('utf8')
+
+  core.setOutput('lint_exit_code', String(exitCode))
+
+  const fatalMatch = stdout.match(CLI_FATAL_TRAILER_RE)
+  const jsonCandidate = (
+    fatalMatch ? stdout.slice(0, fatalMatch.index) : stdout
+  ).trim()
+
+  let report = null
+  if (jsonCandidate !== '') {
+    try {
+      const parsed = JSON.parse(jsonCandidate)
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        Array.isArray(parsed.findings)
+      ) {
+        report = parsed
+      }
+    } catch {
+      report = null
+    }
+  }
+
+  if (!report) {
+    const { errorMessage } = parseDriftCliOutput(stdout, stderr, exitCode || 1)
+    core.setFailed(
+      errorMessage || `pbuf lint failed with exit code ${exitCode}`
+    )
+    return
+  }
+
+  const findings = report.findings
+  const filesCount = Number.isInteger(report.files) ? report.files : 0
+  if (exitCode === 0 && findings.length === 0) {
+    core.info(`pbuf lint passed (${filesCount} file(s) checked, 0 violations).`)
+    return
+  }
+
+  for (const finding of findings.slice(0, MAX_LINT_ANNOTATIONS)) {
+    if (!finding || typeof finding !== 'object') {
+      continue
+    }
+    const rule = typeof finding.rule === 'string' ? finding.rule.trim() : ''
+    const props = {
+      title: rule ? `pbuf lint (${rule})` : 'pbuf lint'
+    }
+    const file = resolveAnnotationFile(finding.filename, workingDirectory)
+    if (file) {
+      props.file = file
+    }
+    if (Number.isInteger(finding.line) && finding.line > 0) {
+      props.startLine = finding.line
+    }
+    if (Number.isInteger(finding.column) && finding.column > 0) {
+      props.startColumn = finding.column
+    }
+    const prefix = rule ? `[${rule}] ` : ''
+    const message =
+      typeof finding.message === 'string' && finding.message.trim() !== ''
+        ? finding.message.trim()
+        : 'Proto lint violation'
+    core.error(`${prefix}${message}`, props)
+  }
+
+  if (findings.length > MAX_LINT_ANNOTATIONS) {
+    core.warning(
+      `Showing first ${MAX_LINT_ANNOTATIONS} of ${findings.length} pbuf lint violations.`
+    )
+  }
+
+  if (findings.length > 0) {
+    core.setFailed(
+      `pbuf lint failed: ${findings.length} violation(s) found across ${filesCount} file(s)`
+    )
+    return
+  }
+
+  const { errorMessage } = parseDriftCliOutput('', stderr, exitCode)
+  core.setFailed(errorMessage || `pbuf lint failed with exit code ${exitCode}`)
 }
 
 async function runDriftDiff(workingDirectory, githubToken) {
@@ -3938,7 +4124,7 @@ async function run() {
       core.info('No pbuf_token provided, skipping login')
     }
 
-    await installPbufCli(version, githubToken)
+    const plainVersion = await installPbufCli(version, githubToken)
 
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
@@ -3949,6 +4135,10 @@ async function run() {
     }
 
     core.info('Successfully setup pbuf cli')
+
+    if (core.getInput('lint').trim().toLowerCase() === 'true') {
+      await runLint(workingDirectory, plainVersion)
+    }
 
     if (core.getInput('drift_diff').trim().toLowerCase() === 'true') {
       await runDriftDiff(workingDirectory, githubToken)
@@ -3964,8 +4154,11 @@ module.exports = {
   normalizeRegistryAddr,
   parseDriftCliOutput,
   parseExpectedChecksum,
+  parseLintPaths,
+  resolveAnnotationFile,
   resolvePlatform,
-  run
+  run,
+  supportsLint
 }
 
 
