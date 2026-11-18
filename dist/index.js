@@ -3545,10 +3545,13 @@ function parseDriftCliOutput(rawStdout, rawStderr, exitCode) {
   return { markdown: cleanedStdout, errorMessage: cleanedStderr }
 }
 
-function parseBooleanInput(name) {
+function parseBooleanInput(name, defaultValue = false) {
   const raw = core.getInput(name).trim()
   const normalized = raw.toLowerCase()
-  if (normalized === '' || normalized === 'false') {
+  if (normalized === '') {
+    return defaultValue
+  }
+  if (normalized === 'false') {
     return false
   }
   if (normalized === 'true') {
@@ -4088,7 +4091,25 @@ function cleanupPost() {
   }
 }
 
-async function runLint(workingDirectory, plainVersion) {
+function escapeSummaryCell(value) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/[\\|*_\x60[\]]/g, '\\$&')
+    .replace(/\r\n|\r|\n/g, ' ')
+}
+
+async function writeJobSummary(markdown) {
+  try {
+    await core.summary.addRaw(markdown).addEOL().addEOL().write()
+  } catch (error) {
+    core.summary.emptyBuffer()
+    core.warning(`Could not write job summary (${error.message}).`)
+  }
+}
+
+async function runLint(workingDirectory, plainVersion, summaryEnabled) {
   if (!supportsLint(plainVersion)) {
     core.setFailed(
       `pbuf lint requires pbuf CLI v0.19.0 or newer (installed v${plainVersion})`
@@ -4143,10 +4164,7 @@ async function runLint(workingDirectory, plainVersion) {
 
   const findings = report.findings
   const filesCount = Number.isInteger(report.files) ? report.files : 0
-  if (exitCode === 0 && findings.length === 0) {
-    core.info(`pbuf lint passed (${filesCount} file(s) checked, 0 violations).`)
-    return
-  }
+  const summaryRows = []
 
   for (const finding of findings.slice(0, MAX_LINT_ANNOTATIONS)) {
     if (!finding || typeof finding !== 'object') {
@@ -4172,6 +4190,35 @@ async function runLint(workingDirectory, plainVersion) {
         ? finding.message.trim()
         : 'Proto lint violation'
     core.error(`${prefix}${message}`, props)
+    if (summaryEnabled) {
+      const location = [file, props.startLine, props.startColumn]
+        .filter(Boolean)
+        .join(':')
+      const cells = [location || '—', rule || '—', message].map(
+        escapeSummaryCell
+      )
+      summaryRows.push(`| ${cells.join(' | ')} |`)
+    }
+  }
+
+  if (summaryEnabled) {
+    const summary = [
+      '### pbuf lint',
+      '',
+      `${filesCount} file(s) checked, ${findings.length} violation(s). Exit code: ${exitCode}.`
+    ]
+    if (summaryRows.length > 0) {
+      summary.push('', '| Location | Rule | Finding |', '| --- | --- | --- |')
+      summary.push(...summaryRows)
+    }
+    if (findings.length > MAX_LINT_ANNOTATIONS) {
+      summary.push('', `Showing the first ${MAX_LINT_ANNOTATIONS} findings.`)
+    }
+    await writeJobSummary(summary.join('\n'))
+  }
+  if (exitCode === 0 && findings.length === 0) {
+    core.info(`pbuf lint passed (${filesCount} file(s) checked, 0 violations).`)
+    return
   }
 
   if (findings.length > MAX_LINT_ANNOTATIONS) {
@@ -4191,7 +4238,12 @@ async function runLint(workingDirectory, plainVersion) {
   core.setFailed(errorMessage || `pbuf lint failed with exit code ${exitCode}`)
 }
 
-async function runDriftDiff(workingDirectory, githubToken, commentOnPr) {
+async function runDriftDiff(
+  workingDirectory,
+  githubToken,
+  commentOnPr,
+  summaryEnabled
+) {
   const failOn = (core.getInput('fail_on').trim() || 'critical').toLowerCase()
   if (!VALID_FAIL_ON.has(failOn)) {
     core.setFailed(
@@ -4229,8 +4281,8 @@ async function runDriftDiff(workingDirectory, githubToken, commentOnPr) {
     core.info(markdown.replace(/(^|\r?\n)(\s*)::/g, '$1$2: :'))
   }
 
-  if (markdown !== '' && process.env.GITHUB_STEP_SUMMARY) {
-    await core.summary.addRaw(markdown).addEOL().write()
+  if (markdown !== '' && summaryEnabled) {
+    await writeJobSummary(markdown)
   }
 
   if (commentOnPr && markdown !== '') {
@@ -4259,6 +4311,9 @@ async function run() {
     const lintEnabled = parseBooleanInput('lint')
     const driftDiffEnabled = parseBooleanInput('drift_diff')
     const commentOnPr = parseBooleanInput('comment_on_pr')
+    const summaryEnabled =
+      parseBooleanInput('job_summary', true) &&
+      Boolean(process.env.GITHUB_STEP_SUMMARY)
     const workingDirectory = core.getInput('working_directory').trim()
     const githubToken =
       core.getInput('github_token') || process.env.GITHUB_TOKEN || ''
@@ -4312,11 +4367,16 @@ async function run() {
     core.info('Successfully setup pbuf cli')
 
     if (lintEnabled) {
-      await runLint(workingDirectory, plainVersion)
+      await runLint(workingDirectory, plainVersion, summaryEnabled)
     }
 
     if (driftDiffEnabled) {
-      await runDriftDiff(workingDirectory, githubToken, commentOnPr)
+      await runDriftDiff(
+        workingDirectory,
+        githubToken,
+        commentOnPr,
+        summaryEnabled
+      )
     }
   } catch (error) {
     core.setFailed(error instanceof Error ? error.message : String(error))

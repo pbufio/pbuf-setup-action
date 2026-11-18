@@ -929,6 +929,72 @@ describe('action', () => {
     expect(setFailedMock).toHaveBeenCalledWith('no .proto files found in api')
   })
 
+  it.each([
+    ['', true],
+    ['false', false]
+  ])(
+    'honors job_summary=%s for lint and drift reports',
+    async (input, enabled) => {
+      process.env.GITHUB_STEP_SUMMARY = path.join(tempDir, 'summary.md')
+      const summaries = []
+      const write = jest
+        .spyOn(core.summary, 'write')
+        .mockImplementation(async () => {
+          summaries.push(core.summary.stringify())
+          return core.summary.emptyBuffer()
+        })
+      const inputs = {
+        version: 'v0.19.0',
+        lint: 'true',
+        drift_diff: 'true',
+        job_summary: input
+      }
+      getInputMock.mockImplementation(name => inputs[name] || '')
+      execMock.mockImplementation(async (cmd, args, options) => {
+        if (cmd === 'pbuf' && args[0] === 'lint') {
+          options.listeners.stdout(
+            Buffer.from(
+              JSON.stringify({
+                files: 1,
+                findings: [
+                  {
+                    filename: 'proto/example.proto',
+                    line: 3,
+                    column: 4,
+                    rule: 'FIELD_NAME',
+                    message: 'Use first | second'
+                  }
+                ]
+              })
+            )
+          )
+          return 1
+        }
+        if (cmd === 'pbuf' && args[0] === 'drift') {
+          options.listeners.stdout(
+            Buffer.from('### Schema Drift Diff: example\n')
+          )
+        }
+        return 0
+      })
+      try {
+        await main.run()
+        const summary = summaries.join('\n')
+        expect(summaries).toHaveLength(enabled ? 2 : 0)
+        expect([
+          summary.includes('### pbuf lint'),
+          summary.includes('proto/example.proto:3:4'),
+          summary.includes('| FIELD\\_NAME | Use first \\| second |'),
+          summary.includes('### Schema Drift Diff: example')
+        ]).toEqual(Array(4).fill(enabled))
+        expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
+        expect(setOutputMock).toHaveBeenCalledWith('drift_exit_code', '0')
+      } finally {
+        write.mockRestore()
+      }
+    }
+  )
+
   it('fails cleanly when lint is enabled with pbuf CLI older than v0.19.0', async () => {
     const oldDir = path.join(toolCacheDir, 'pbuf', '0.18.0', archName)
     fs.mkdirSync(oldDir, { recursive: true })

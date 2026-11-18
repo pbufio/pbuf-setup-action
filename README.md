@@ -22,6 +22,7 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 | `against` | No | `''` | Baseline registry tag to compare against (defaults to the latest published tag). |
 | `working_directory` | No | `''` | Directory containing `pbuf.yaml` for `pbuf auth`, `pbuf lint`, and `pbuf drift diff`. |
 | `comment_on_pr` | No | `'false'` | When `'true'` on `pull_request` events, posts or updates a single sticky PR comment (`<!-- pbuf-drift-diff -->`) with the Markdown report. |
+| `job_summary` | No | `'true'` | Writes lint and drift reports to the Actions run summary when available. Set to `'false'` to suppress these reports independently of annotations and PR comments. |
 | `github_token` | No | `${{ github.token }}` | GitHub token used for authenticated `latest` release lookup and sticky PR comments (`pull-requests: write` required for comments). |
 
 ## Outputs
