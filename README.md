@@ -11,12 +11,13 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 
 | Input | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `version` | No | `'v0.20.0'` | Version of `pbuf` CLI to install (for example `'v0.20.0'` or `'latest'`). |
+| `version` | No | `'v0.21.0'` | Version of `pbuf` CLI to install (for example `'v0.21.0'` or `'latest'`). |
 | `pbuf_token` | No | `''` | API token for authenticating with the PBUF registry (`pbuf auth`). |
 | `registry_url` | No | `''` | Self-hosted registry address (`host[:port]` or URL), exported as `PBUF_REGISTRY_ADDR`. |
 | `registry_insecure` | No | `'false'` | When `'true'`, exports `PBUF_REGISTRY_INSECURE=true` for plaintext gRPC connections (used with `registry_url` or `PBUF_REGISTRY_ADDR`). |
 | `lint` | No | `'false'` | When `'true'`, runs `pbuf lint -o json` offline (requires `v0.19.0+`) and emits inline GitHub Actions file annotations on violations. |
 | `lint_paths` | No | `''` | Optional newline- or whitespace-separated paths passed to `pbuf lint` (quote paths containing spaces; defaults to `export.paths` in `pbuf.yaml`, or `api` / `proto` — set `lint_paths: .` to scan the whole directory). |
+| `lint_ignore_rules` | No | `''` | Optional comma-, whitespace-, or newline-separated rule IDs passed to `pbuf lint --ignore-rule` (requires `v0.21.0+`, e.g. `'FILE_NAME,ENUM_ZERO_VALUE'`). |
 | `drift_diff` | No | `'false'` | When `'true'`, runs `pbuf drift diff --format=markdown` against the registry baseline. |
 | `fail_on` | No | `'critical'` | Severity threshold to fail drift checks (`critical`, `warning`, `info`, or `none`). |
 | `against` | No | `''` | Baseline registry tag to compare against (defaults to the latest published tag). |
@@ -44,7 +45,7 @@ steps:
   - name: Install pbuf CLI
     uses: pbufio/pbuf-setup-action@v1
     with:
-      version: 'v0.20.0'
+      version: 'v0.21.0'
       pbuf_token: ${{ secrets.PBUF_TOKEN }}
 
   - name: Register and Push Module

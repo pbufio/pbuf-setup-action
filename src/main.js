@@ -410,6 +410,28 @@ function supportsLint(plainVersion) {
   return major > 0 || minor >= 19
 }
 
+function supportsLintIgnoreRule(plainVersion) {
+  const [major, minor] = plainVersion.split('.', 2).map(Number)
+  return major > 0 || minor >= 21
+}
+
+function parseLintIgnoreRules(raw) {
+  const trimmed = raw.trim()
+  if (trimmed === '') {
+    return []
+  }
+  const seen = new Set()
+  for (const part of trimmed.split(',')) {
+    for (const token of part.trim().split(/\s+/)) {
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(token)) {
+        throw new Error(`Invalid lint_ignore_rules entry "${token}"`)
+      }
+      seen.add(token.toUpperCase())
+    }
+  }
+  return [...seen]
+}
+
 function parseLintPaths(raw) {
   const paths = []
   let current = ''
@@ -686,16 +708,27 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
   }
 
   let paths
+  let ignoreRules
   try {
     paths = parseLintPaths(core.getInput('lint_paths'))
+    ignoreRules = parseLintIgnoreRules(core.getInput('lint_ignore_rules'))
   } catch (error) {
     core.setFailed(error instanceof Error ? error.message : String(error))
     return
   }
-  const args =
-    paths.length > 0
-      ? ['lint', '-o', 'json', '--', ...paths]
-      : ['lint', '-o', 'json']
+  if (ignoreRules.length > 0 && !supportsLintIgnoreRule(plainVersion)) {
+    core.setFailed(
+      `lint_ignore_rules requires pbuf CLI v0.21.0 or newer (installed v${plainVersion})`
+    )
+    return
+  }
+  const args = ['lint', '-o', 'json']
+  if (ignoreRules.length > 0) {
+    args.push(`--ignore-rule=${ignoreRules.join(',')}`)
+  }
+  if (paths.length > 0) {
+    args.push('--', ...paths)
+  }
 
   const { exitCode, stdout, stderr } = await execPbuf(args, workingDirectory)
 
@@ -935,6 +968,8 @@ async function run() {
 
     if (lintEnabled) {
       await runLint(workingDirectory, plainVersion, summaryEnabled)
+    } else if (core.getInput('lint_ignore_rules').trim() !== '') {
+      core.warning('lint_ignore_rules has no effect unless lint is true.')
     }
 
     if (driftDiffEnabled) {
@@ -958,10 +993,12 @@ module.exports = {
   parseBooleanInput,
   parseDriftCliOutput,
   parseExpectedChecksum,
+  parseLintIgnoreRules,
   parseLintPaths,
   resolveAnnotationFile,
   resolvePlatform,
   run,
   supportsLint,
+  supportsLintIgnoreRule,
   truncateMarkdown
 }
