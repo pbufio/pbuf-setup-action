@@ -76,12 +76,12 @@ jobs:
       - name: Check pbuf CLI
         id: check-pbuf-cli
         run: |
-          pbuf --version | grep "v0.20.0"
+          pbuf --version | grep "v0.21.0"
           SMOKE_DIR="${RUNNER_TEMP}/pbuf-smoke"
           mkdir -p "${SMOKE_DIR}/api" && cd "${SMOKE_DIR}"
           pbuf init pbufio/pbuf-setup-action
           test -f pbuf.yaml
-          cat <<'EOF' > "${SMOKE_DIR}/api/hello.proto"
+          cat <<'EOF' > "${SMOKE_DIR}/api/HelloService.proto"
           syntax = "proto3";
           package smoke.v1;
           message HelloRequest {
@@ -106,6 +106,7 @@ jobs:
         uses: ./
         with:
           lint: true
+          lint_ignore_rules: FILE_NAME
           working_directory: ${{ runner.temp }}/pbuf-smoke
 
       - name: Verify Lint Output

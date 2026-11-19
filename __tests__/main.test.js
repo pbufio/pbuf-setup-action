@@ -1071,6 +1071,108 @@ describe('action', () => {
     )
   })
 
+  it('passes --ignore-rule to pbuf lint on v0.21.0+, rejects < v0.21.0 or invalid rule tokens, and warns when lint is false', async () => {
+    const v21Dir = path.join(toolCacheDir, 'pbuf', '0.21.0', archName)
+    fs.mkdirSync(v21Dir, { recursive: true })
+    fs.writeFileSync(path.join(v21Dir, 'pbuf'), '#!/bin/sh\n', { mode: 0o755 })
+
+    expect(main.supportsLintIgnoreRule('0.20.9')).toBe(false)
+    expect(main.supportsLintIgnoreRule('0.21.0')).toBe(true)
+    expect(main.supportsLintIgnoreRule('0.21.0-rc.1')).toBe(true)
+    expect(main.supportsLintIgnoreRule('1.0.0')).toBe(true)
+    expect(main.parseLintIgnoreRules('  ')).toEqual([])
+    expect(
+      main.parseLintIgnoreRules(' file_name , ENUM_ZERO_VALUE\nfile_name ')
+    ).toEqual(['FILE_NAME', 'ENUM_ZERO_VALUE'])
+    expect(() => main.parseLintIgnoreRules(',')).toThrow(
+      'Invalid lint_ignore_rules entry ""'
+    )
+    expect(() => main.parseLintIgnoreRules('FILE_NAME,')).toThrow(
+      'Invalid lint_ignore_rules entry ""'
+    )
+    expect(() => main.parseLintIgnoreRules('--output=table')).toThrow(
+      'Invalid lint_ignore_rules entry "--output=table"'
+    )
+
+    // v0.21.0 passes normalized --ignore-rule flag before -- paths
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.21.0'
+        case 'lint':
+          return 'true'
+        case 'lint_ignore_rules':
+          return 'file_name, enum_zero_value'
+        case 'lint_paths':
+          return 'api'
+        default:
+          return ''
+      }
+    })
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(
+          Buffer.from(JSON.stringify({ files: 1, findings: [] }))
+        )
+      }
+      return 0
+    })
+    await main.run()
+    expect(execMock).toHaveBeenCalledWith(
+      'pbuf',
+      [
+        'lint',
+        '-o',
+        'json',
+        '--ignore-rule=FILE_NAME,ENUM_ZERO_VALUE',
+        '--',
+        'api'
+      ],
+      expect.anything()
+    )
+    expect(setFailedMock).not.toHaveBeenCalled()
+
+    // < v0.21.0 rejects lint_ignore_rules cleanly
+    setFailedMock.mockClear()
+    execMock.mockClear()
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.20.0'
+        case 'lint':
+          return 'true'
+        case 'lint_ignore_rules':
+          return 'FILE_NAME'
+        default:
+          return ''
+      }
+    })
+    const v20Dir = path.join(toolCacheDir, 'pbuf', '0.20.0', archName)
+    fs.mkdirSync(v20Dir, { recursive: true })
+    fs.writeFileSync(path.join(v20Dir, 'pbuf'), '#!/bin/sh\n', { mode: 0o755 })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'lint_ignore_rules requires pbuf CLI v0.21.0 or newer (installed v0.20.0)'
+    )
+    expect(execMock).not.toHaveBeenCalledWith(
+      'pbuf',
+      expect.arrayContaining(['lint']),
+      expect.anything()
+    )
+
+    // lint_ignore_rules without lint: true logs a warning
+    warningMock.mockClear()
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.21.0'
+      if (name === 'lint_ignore_rules') return 'FILE_NAME'
+      return ''
+    })
+    await main.run()
+    expect(warningMock).toHaveBeenCalledWith(
+      'lint_ignore_rules has no effect unless lint is true.'
+    )
+  })
+
   it('supportsLint, parseLintPaths, and resolveAnnotationFile handle version, quote, chunk, and path edge cases', async () => {
     expect(main.supportsLint('0.18.0')).toBe(false)
     expect(main.supportsLint('0.19.0')).toBe(true)
