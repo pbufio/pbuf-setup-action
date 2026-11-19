@@ -672,7 +672,8 @@ async function writeJobSummary(markdown) {
     await core.summary.addRaw(markdown).addEOL().addEOL().write()
   } catch (error) {
     core.summary.emptyBuffer()
-    core.warning(`Could not write job summary (${error.message}).`)
+    const detail = error instanceof Error ? error.message : String(error)
+    core.warning(`Could not write job summary (${detail}).`)
   }
 }
 
@@ -729,14 +730,13 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
     return
   }
 
-  const findings = report.findings
+  const findings = report.findings.filter(
+    f => f && typeof f === 'object' && !Array.isArray(f)
+  )
   const filesCount = Number.isInteger(report.files) ? report.files : 0
   const summaryRows = []
 
   for (const finding of findings.slice(0, MAX_LINT_ANNOTATIONS)) {
-    if (!finding || typeof finding !== 'object') {
-      continue
-    }
     const rule = typeof finding.rule === 'string' ? finding.rule.trim() : ''
     const props = {
       title: rule ? `pbuf lint (${rule})` : 'pbuf lint'
