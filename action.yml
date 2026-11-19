@@ -50,6 +50,10 @@ inputs:
     description: Post or update a sticky pull request comment with the drift diff report.
     required: false
     default: 'false'
+  job_summary:
+    description: Write lint and drift reports to the GitHub Actions job summary.
+    required: false
+    default: 'true'
   github_token:
     description: GitHub token used for authenticated latest CLI release lookup and sticky pull request comments.
     required: false

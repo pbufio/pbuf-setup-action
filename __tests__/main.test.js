@@ -40,6 +40,8 @@ describe('action', () => {
     delete process.env.GITHUB_TOKEN
     delete process.env.GITHUB_API_URL
     delete process.env.GITHUB_WORKSPACE
+    core.summary.emptyBuffer()
+    delete core.summary._filePath
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pbuf-action-test-'))
     fakeHome = path.join(tempDir, 'home')
     fs.mkdirSync(fakeHome, { recursive: true })
@@ -927,6 +929,118 @@ describe('action', () => {
 
     expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
     expect(setFailedMock).toHaveBeenCalledWith('no .proto files found in api')
+  })
+
+  it.each([
+    ['', true],
+    ['false', false]
+  ])(
+    'honors job_summary=%s for lint and drift reports with real summary file and escaping',
+    async (input, enabled) => {
+      const summaryPath = path.join(tempDir, 'summary.md')
+      fs.writeFileSync(summaryPath, '')
+      process.env.GITHUB_STEP_SUMMARY = summaryPath
+      const inputs = {
+        version: 'v0.19.0',
+        lint: 'true',
+        drift_diff: 'true',
+        job_summary: input
+      }
+      getInputMock.mockImplementation(name => inputs[name] || '')
+      execMock.mockImplementation(async (cmd, args, options) => {
+        if (cmd === 'pbuf' && args[0] === 'lint') {
+          const manyFindings = Array.from({ length: 50 }, (_, idx) => ({
+            filename: `proto/extra_${idx + 1}.proto`,
+            line: 1,
+            column: 1,
+            rule: 'FILE_NAME',
+            message: `Violation ${idx + 1}`
+          }))
+          options.listeners.stdout(
+            Buffer.from(
+              JSON.stringify({
+                files: 2,
+                findings: [
+                  null,
+                  [],
+                  {
+                    filename: 'proto/example.proto',
+                    line: 3,
+                    column: 4,
+                    rule: 'FIELD_NAME',
+                    message:
+                      'Use first | second <script> [x](https://evil)\r\nnext'
+                  },
+                  ...manyFindings
+                ]
+              })
+            )
+          )
+          return 1
+        }
+        if (cmd === 'pbuf' && args[0] === 'drift') {
+          options.listeners.stdout(
+            Buffer.from('### Schema Drift Diff: example\n')
+          )
+        }
+        return 0
+      })
+
+      await main.run()
+      const summary = fs.readFileSync(summaryPath, 'utf8')
+      expect([
+        summary.includes('### pbuf lint'),
+        summary.includes('2 file(s) checked, 51 violation(s).'),
+        summary.includes('proto/example.proto:3:4'),
+        summary.includes(
+          '| FIELD\\_NAME | Use first \\| second &lt;script&gt; \\[x\\](https://evil) next |'
+        ),
+        summary.includes('Showing the first 50 findings.'),
+        summary.includes('### Schema Drift Diff: example')
+      ]).toEqual(Array(6).fill(enabled))
+      expect(summary.includes('Violation 50')).toBe(false)
+      expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
+      expect(setOutputMock).toHaveBeenCalledWith('drift_exit_code', '0')
+    }
+  )
+
+  it('writes 0-violation lint summary and warns cleanly when GITHUB_STEP_SUMMARY write fails', async () => {
+    const cleanSummaryPath = path.join(tempDir, 'clean-summary.md')
+    fs.writeFileSync(cleanSummaryPath, '')
+    process.env.GITHUB_STEP_SUMMARY = cleanSummaryPath
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.19.0'
+      if (name === 'lint') return 'true'
+      return ''
+    })
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'lint') {
+        options.listeners.stdout(
+          Buffer.from(JSON.stringify({ files: 3, findings: [] }))
+        )
+      }
+      return 0
+    })
+
+    await main.run()
+    const cleanSummary = fs.readFileSync(cleanSummaryPath, 'utf8')
+    expect(cleanSummary).toContain(
+      '3 file(s) checked, 0 violation(s). Exit code: 0.'
+    )
+    expect(cleanSummary).not.toContain('| Location | Rule | Finding |')
+    expect(setFailedMock).not.toHaveBeenCalled()
+
+    // Now simulate an unwritable GITHUB_STEP_SUMMARY path (missing file)
+    core.summary.emptyBuffer()
+    delete core.summary._filePath
+    process.env.GITHUB_STEP_SUMMARY = path.join(tempDir, 'missing-summary.md')
+
+    await main.run()
+    expect(core.summary.isEmptyBuffer()).toBe(true)
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('Could not write job summary')
+    )
+    expect(setFailedMock).not.toHaveBeenCalled()
   })
 
   it('fails cleanly when lint is enabled with pbuf CLI older than v0.19.0', async () => {
