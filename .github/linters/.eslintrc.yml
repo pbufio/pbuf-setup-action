@@ -12,9 +12,9 @@ globals:
 
 ignorePatterns:
   - '!.*'
-  - '**/node_modules/.*'
-  - '**/dist/.*'
-  - '**/coverage/.*'
+  - '**/node_modules/**'
+  - '**/dist/**'
+  - '**/coverage/**'
   - '*.json'
 
 parserOptions:
