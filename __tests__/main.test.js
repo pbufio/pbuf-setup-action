@@ -22,6 +22,7 @@ const setSecretMock = jest.spyOn(core, 'setSecret').mockImplementation()
 const exportVarMock = jest.spyOn(core, 'exportVariable').mockImplementation()
 const execMock = jest.spyOn(exec, 'exec').mockImplementation()
 const homedirMock = jest.spyOn(os, 'homedir')
+const userInfoMock = jest.spyOn(os, 'userInfo')
 
 describe('action', () => {
   const originalEnv = process.env
@@ -46,6 +47,7 @@ describe('action', () => {
     fakeHome = path.join(tempDir, 'home')
     fs.mkdirSync(fakeHome, { recursive: true })
     homedirMock.mockReturnValue(fakeHome)
+    userInfoMock.mockImplementation(() => ({ homedir: fakeHome }))
     process.env.RUNNER_TEMP = path.join(tempDir, 'runner-temp')
     toolCacheDir = path.join(tempDir, 'tool-cache')
     process.env.RUNNER_TOOL_CACHE = toolCacheDir
@@ -132,10 +134,10 @@ describe('action', () => {
     expect(execMock).toHaveBeenCalledWith(
       'pbuf',
       ['auth', '--', 'pbuf_token_test'],
-      {
+      expect.objectContaining({
         cwd: 'services/billing',
         silent: true
-      }
+      })
     )
 
     fetchMock.mockRestore()
@@ -193,7 +195,7 @@ describe('action', () => {
     fetchMock.mockRestore()
   })
 
-  it('omits GHES token when resolving latest release on api.github.com and uses --help for < v0.17.0', async () => {
+  it('omits GHES token by resolving latest release via web redirect and uses --help for < v0.17.0', async () => {
     process.env.GITHUB_API_URL = 'https://ghes.acme.internal/api/v3'
     const legacyDir = path.join(toolCacheDir, 'pbuf', '0.16.0', archName)
     fs.mkdirSync(legacyDir, { recursive: true })
@@ -207,41 +209,64 @@ describe('action', () => {
     })
 
     const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ tag_name: 'v0.16.0' })
+      ok: false,
+      status: 302,
+      headers: {
+        get: key =>
+          key.toLowerCase() === 'location'
+            ? '/pbufio/pbuf-registry/releases/tag/v0.16.0/?utm=1#top'
+            : null
+      }
     })
 
     await main.run()
 
     expect(setFailedMock).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://github.com/pbufio/pbuf-registry/releases/latest',
+      expect.objectContaining({ redirect: 'manual' })
+    )
     expect(fetchMock.mock.calls[0][1].headers.Authorization).toBeUndefined()
     expect(execMock).toHaveBeenCalledWith(legacyBin, ['--help'])
     fetchMock.mockRestore()
   })
 
-  it('retries latest release lookup anonymously on 403 and rejects malformed tag_name', async () => {
+  it('falls back to web redirect on 403 and rejects malformed release tag', async () => {
     getInputMock.mockImplementation(name => {
       if (name === 'version') return 'latest'
       if (name === 'github_token') return 'emu_scoped_token'
       return ''
     })
 
+    const cancelMock = jest.fn().mockResolvedValue()
     const fetchMock = jest
       .spyOn(global, 'fetch')
-      .mockResolvedValueOnce({ ok: false, status: 403 })
       .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ tag_name: '../evil' })
+        ok: false,
+        status: 403,
+        body: { cancel: cancelMock }
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 302,
+        headers: {
+          get: key =>
+            key.toLowerCase() === 'location'
+              ? 'https://github.com/pbufio/pbuf-registry/releases/tag/not-a-semver'
+              : null
+        }
       })
 
     await main.run()
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(cancelMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      'https://github.com/pbufio/pbuf-registry/releases/latest'
+    )
     expect(fetchMock.mock.calls[1][1].headers.Authorization).toBeUndefined()
     expect(setFailedMock).toHaveBeenCalledWith(
-      'Invalid release tag "../evil" returned by GitHub API'
+      'Invalid release tag "not-a-semver" returned by GitHub'
     )
     fetchMock.mockRestore()
   })
@@ -1169,7 +1194,7 @@ describe('action', () => {
     })
     await main.run()
     expect(warningMock).toHaveBeenCalledWith(
-      'lint_ignore_rules has no effect unless lint is true.'
+      'lint_paths and lint_ignore_rules have no effect unless lint is true.'
     )
   })
 
@@ -1311,6 +1336,29 @@ describe('action', () => {
     expect(fs.readFileSync(dotfileNetrc, 'utf8')).toBe(
       'machine corp.internal login ci password keepme\n'
     )
+
+    // Symlinked ~/.netrc where writeFileSync throws after unlinkSync -> post still restores symlink
+    for (const key of Object.keys(savedState)) {
+      delete savedState[key]
+    }
+    setFailedMock.mockClear()
+    const writeSpy = jest
+      .spyOn(fs, 'writeFileSync')
+      .mockImplementationOnce(() => {
+        throw new Error('ENOSPC: no space left on device')
+      })
+    await main.run()
+    writeSpy.mockRestore()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'ENOSPC: no space left on device'
+    )
+    expect(fs.existsSync(netrcPath)).toBe(false)
+    expect(savedState.netrcMode).toBe('symlink')
+    expect(savedState.netrcSymlinkTarget).toBe(dotfileNetrc)
+
+    await main.run()
+    expect(fs.lstatSync(netrcPath).isSymbolicLink()).toBe(true)
+    expect(fs.readlinkSync(netrcPath)).toBe(dotfileNetrc)
   })
 
   it('retries transient 503/429, network errors, and mid-stream body drops in fetchWithRetry', async () => {
@@ -1372,10 +1420,13 @@ describe('action', () => {
       main.parseExpectedChecksum('deadbeef  other.tar.gz\n', 'missing.tar.gz')
     ).toThrow('Checksum entry for missing.tar.gz not found')
 
-    const tableMarkdown = `${'row-line\n'.repeat(6665)}trailing-cut-row`
+    const tableMarkdown = `### Schema Drift Diff: ex\r\n${'x'.repeat(59930)}\r\n${'y'.repeat(100)}`
     const truncated = main.truncateMarkdown(tableMarkdown)
     expect(truncated).toContain('_...report truncated..._')
-    expect(truncated).not.toContain('trailing-cut-row')
+    expect(truncated).not.toContain('yyyy')
+    expect(truncated).not.toContain('\r\n\n_...report truncated..._')
+    expect(truncated.length).toBeLessThanOrEqual(60000)
+    expect(main.truncateMarkdown(truncated)).toBe(truncated)
 
     // Non-PR push event skips comment cleanly
     jest.clearAllMocks()
@@ -1415,5 +1466,177 @@ describe('action', () => {
       'Skipping PR comment: workflow event is not a pull request'
     )
     expect(setFailedMock).toHaveBeenCalledWith('not-json')
+  })
+
+  it('hardens container .netrc home lookup, whitespace tokens, auth stderr, CR escaping, Retry-After, and idle warnings', async () => {
+    // 1. Whitespace pbuf_token and github_token rejected before install/auth
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.21.0'
+      if (name === 'pbuf_token') return 'Bearer pbuf_bad'
+      return ''
+    })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid pbuf_token: token must not contain whitespace'
+    )
+    expect(execMock).not.toHaveBeenCalled()
+
+    setFailedMock.mockClear()
+    setSecretMock.mockClear()
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.21.0'
+      if (name === 'github_token') return '  ghp_tok\ninjected  '
+      return ''
+    })
+    await main.run()
+    expect(setSecretMock).toHaveBeenCalledWith('ghp_tok\ninjected')
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid github_token: token must not contain whitespace'
+    )
+    expect(execMock).not.toHaveBeenCalled()
+
+    // Reject SSO/proxy redirect Location on latest lookup
+    setFailedMock.mockClear()
+    getInputMock.mockImplementation(name =>
+      name === 'version' ? 'latest' : ''
+    )
+    const ssoFetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: false,
+      status: 302,
+      headers: {
+        get: key =>
+          key.toLowerCase() === 'location'
+            ? 'https://sso.corp/login?next=/pbufio/pbuf-registry/releases/tag/v0.1.0'
+            : null
+      }
+    })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Failed to resolve latest pbuf release tag (status 302)'
+    )
+    ssoFetchMock.mockRestore()
+
+    // 2. Container HOME (/github/home) vs passwd homedir (/root) + auth stderr surfacing
+    jest.clearAllMocks()
+    const passwdHome = path.join(tempDir, 'passwd-root')
+    fs.mkdirSync(passwdHome, { recursive: true })
+    userInfoMock.mockImplementation(() => ({ homedir: passwdHome }))
+    const v21Dir = path.join(toolCacheDir, 'pbuf', '0.21.0', archName)
+    fs.mkdirSync(v21Dir, { recursive: true })
+    fs.writeFileSync(path.join(v21Dir, 'pbuf'), '#!/bin/sh\n', { mode: 0o755 })
+
+    const savedState = {}
+    saveStateMock.mockImplementation((k, v) => {
+      savedState[k] = v
+    })
+    getStateMock.mockImplementation(k => savedState[k] || '')
+
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.21.0'
+      if (name === 'pbuf_token') return 'pbuf_valid_token'
+      return ''
+    })
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'auth') {
+        options.listeners.stderr(
+          Buffer.from('failed to save .netrc file: permission denied\n')
+        )
+        return 1
+      }
+      return 0
+    })
+    await main.run()
+    expect(savedState.netrcPath).toBe(path.join(passwdHome, '.netrc'))
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'failed to save .netrc file: permission denied'
+    )
+
+    // 3. Tokenless post-cleanup exits cleanly, and userInfo throw falls back to os.homedir()
+    for (const k of Object.keys(savedState)) delete savedState[k]
+    savedState.isPost = 'true'
+    await main.run()
+
+    for (const k of Object.keys(savedState)) delete savedState[k]
+    userInfoMock.mockImplementation(() => {
+      throw new Error('ENOENT: no passwd entry')
+    })
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.21.0'
+        case 'pbuf_token':
+          return 'pbuf_valid_token'
+        case 'lint':
+          return 'true'
+        case 'lint_ignore_rules':
+          return '--bad'
+        case 'comment_on_pr':
+          return 'true'
+        default:
+          return ''
+      }
+    })
+    execMock.mockResolvedValue(0)
+    setFailedMock.mockClear()
+    warningMock.mockClear()
+    await main.run()
+    expect(savedState.netrcPath).toBe(path.join(fakeHome, '.netrc'))
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid lint_ignore_rules entry "--bad"'
+    )
+    expect(warningMock).toHaveBeenCalledWith(
+      'comment_on_pr and against have no effect unless drift_diff is true.'
+    )
+
+    // 4. Standalone \r workflow-command escaping and 60k output truncation
+    for (const k of Object.keys(savedState)) delete savedState[k]
+    infoMock.mockClear()
+    setOutputMock.mockClear()
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'v0.21.0'
+      if (name === 'drift_diff') return 'true'
+      return ''
+    })
+    const bigReport = `### Schema Drift Diff: ex\r::error::injected\n${'a'.repeat(60100)}`
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'drift') {
+        options.listeners.stdout(Buffer.from(bigReport))
+      }
+      return 0
+    })
+    await main.run()
+    expect(infoMock).toHaveBeenCalledWith(
+      expect.stringContaining('\r: :error::injected')
+    )
+    const emittedOutput = setOutputMock.mock.calls.find(
+      c => c[0] === 'drift_markdown'
+    )[1]
+    expect(emittedOutput).toContain('_...report truncated..._')
+    expect(emittedOutput.length).toBeLessThan(60100)
+
+    // 5. Retry-After numeric + HTTP-date (on 503) headers + non-zero delay exhaustion in fetchWithRetry
+    const fixedNow = Date.parse('Wed, 20 Nov 2026 10:00:00.995 GMT')
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(fixedNow)
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: k => (k === 'retry-after' ? '0.005' : null) }
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        headers: {
+          get: k =>
+            k === 'retry-after' ? 'Wed, 20 Nov 2026 10:00:01 GMT' : null
+        }
+      })
+      .mockRejectedValueOnce(new Error('final network failure'))
+    await expect(
+      main.fetchWithRetry('https://example.com', {}, 1000, 3, 1)
+    ).rejects.toThrow('final network failure')
+    nowSpy.mockRestore()
+    fetchMock.mockRestore()
   })
 })

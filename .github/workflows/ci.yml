@@ -41,7 +41,7 @@ jobs:
 
       - name: Test
         id: npm-ci-test
-        run: npm run ci-test
+        run: npm test
 
       - name: Verify dist/ Bundle
         id: verify-dist

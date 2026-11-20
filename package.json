@@ -1,7 +1,7 @@
 {
   "name": "pbuf-setup-action",
   "description": "GitHub Action to setup pbuf-cli",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "author": "aatarasoff@gmail.com",
   "exports": {
     ".": "./dist/index.js"
@@ -11,19 +11,15 @@
   },
   "scripts": {
     "bundle": "npm run format:write && npm run package",
-    "ci-test": "jest",
     "format:write": "prettier --write \"**/*.js\"",
     "format:check": "prettier --check \"**/*.js\"",
-    "lint": "npx eslint . -c ./.github/linters/.eslintrc.yml",
+    "lint": "eslint . -c ./.github/linters/.eslintrc.yml",
     "package": "ncc build src/index.js --license licenses.txt",
     "package:watch": "npm run package -- --watch",
     "test": "jest",
     "all": "npm run format:write && npm run lint && npm run test && npm run package"
   },
   "license": "MIT",
-  "eslintConfig": {
-    "extends": "./.github/linters/.eslintrc.yml"
-  },
   "jest": {
     "verbose": true,
     "clearMocks": true,

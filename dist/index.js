@@ -3441,6 +3441,8 @@ const exec = __nccwpck_require__(514)
 
 const RELEASE_API_URL =
   'https://api.github.com/repos/pbufio/pbuf-registry/releases/latest'
+const RELEASE_LATEST_WEB_URL =
+  'https://github.com/pbufio/pbuf-registry/releases/latest'
 const RELEASE_DOWNLOAD_BASE =
   'https://github.com/pbufio/pbuf-registry/releases/download'
 const VERSION_RE = /^(latest|v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$/
@@ -3451,9 +3453,10 @@ const VALID_FAIL_ON = new Set(['critical', 'warning', 'info', 'none'])
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const COMMENT_MARKER = '<!-- pbuf-drift-diff -->'
 const MAX_COMMENT_CHARS = 60000
+const TRUNCATION_NOTICE = '\n\n_...report truncated..._'
 const MAX_COMMENT_PAGES = 25
 const MAX_LINT_ANNOTATIONS = 50
-const DEFAULT_RETRY_DELAY_MS = process.env.NODE_ENV === 'test' ? 0 : 250
+const DEFAULT_RETRY_DELAY_MS = process.env.JEST_WORKER_ID ? 0 : 250
 const CLI_FATAL_TRAILER_RE =
   /(?:^|\r?\n)(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*([\s\S]*)$/
 const CLI_FATAL_PREFIX_RE =
@@ -3562,6 +3565,34 @@ function parseBooleanInput(name, defaultValue = false) {
   )
 }
 
+async function cancelBody(res) {
+  if (res && res.body && typeof res.body.cancel === 'function') {
+    try {
+      await res.body.cancel()
+    } catch {
+      // ignore body cancel errors
+    }
+  }
+}
+
+function parseRetryAfterMs(headers) {
+  if (!headers || typeof headers.get !== 'function') {
+    return 0
+  }
+  const raw = (headers.get('retry-after') || '').trim()
+  if (raw === '') {
+    return 0
+  }
+  const seconds = Number(raw)
+  const deltaMs = Number.isFinite(seconds)
+    ? seconds * 1000
+    : Date.parse(raw) - Date.now()
+  if (!Number.isFinite(deltaMs) || deltaMs <= 0) {
+    return 0
+  }
+  return Math.min(deltaMs, 10000)
+}
+
 async function fetchWithRetry(
   url,
   options = {},
@@ -3570,21 +3601,17 @@ async function fetchWithRetry(
   baseDelayMs = DEFAULT_RETRY_DELAY_MS,
   readBody = null
 ) {
-  let lastError
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  const maxAttempts = Math.max(1, attempts)
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let retryAfterMs = 0
     try {
       const res = await fetch(url, {
         ...options,
         signal: AbortSignal.timeout(timeoutMs)
       })
-      if (attempt < attempts && (res.status === 429 || res.status >= 500)) {
-        if (res.body && typeof res.body.cancel === 'function') {
-          try {
-            await res.body.cancel()
-          } catch {
-            // ignore body cancel errors before retry
-          }
-        }
+      if (attempt < maxAttempts && (res.status === 429 || res.status >= 500)) {
+        retryAfterMs = parseRetryAfterMs(res.headers)
+        await cancelBody(res)
       } else {
         const bodyData =
           res.ok && typeof readBody === 'function'
@@ -3593,31 +3620,28 @@ async function fetchWithRetry(
         return readBody ? { res, bodyData } : res
       }
     } catch (error) {
-      lastError = error
-      if (attempt >= attempts) {
+      if (attempt >= maxAttempts) {
         throw error
       }
     }
-    if (baseDelayMs > 0) {
-      await new Promise(resolve =>
-        setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1))
-      )
+    const delayMs = Math.max(retryAfterMs, baseDelayMs * 2 ** (attempt - 1))
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs))
     }
   }
-  throw lastError
 }
 
 function truncateMarkdown(markdown) {
   if (markdown.length <= MAX_COMMENT_CHARS) {
     return markdown
   }
-  const lastNewline = markdown.lastIndexOf('\n', MAX_COMMENT_CHARS)
-  const cutIndex =
-    lastNewline >= MAX_COMMENT_CHARS - 2000 ? lastNewline : MAX_COMMENT_CHARS
-  const prefix = markdown.slice(0, cutIndex)
+  const budget = MAX_COMMENT_CHARS - TRUNCATION_NOTICE.length
+  const lastNewline = markdown.lastIndexOf('\n', budget)
+  const cutIndex = lastNewline >= budget - 2000 ? lastNewline : budget
+  const prefix = markdown.slice(0, cutIndex).replace(/\r$/, '')
   const safePrefix =
     typeof prefix.toWellFormed === 'function' ? prefix.toWellFormed() : prefix
-  return `${safePrefix}\n\n_...report truncated..._`
+  return `${safePrefix}${TRUNCATION_NOTICE}`
 }
 
 function getPullRequestNumber() {
@@ -3675,18 +3699,20 @@ async function upsertPullRequestComment(
     let existingId = null
     for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
       const listUrl = `${apiBase}/repos/${repository}/issues/${prNumber}/comments?per_page=100&page=${page}`
-      const listRes = await fetchWithRetry(
+      const { res: listRes, bodyData: comments } = await fetchWithRetry(
         listUrl,
         {
           method: 'GET',
           headers
         },
-        10000
+        10000,
+        3,
+        DEFAULT_RETRY_DELAY_MS,
+        r => r.json()
       )
       if (!listRes.ok) {
         throw new Error(`GET comments failed with status ${listRes.status}`)
       }
-      const comments = await listRes.json()
       const found = comments.find(comment => {
         if (!comment || typeof comment.body !== 'string') {
           return false
@@ -3776,47 +3802,86 @@ async function resolveReleaseTag(version, githubToken) {
     return version.startsWith('v') ? version : `v${version}`
   }
 
-  const baseHeaders = {
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'pbuf-setup-action',
-    'X-GitHub-Api-Version': '2022-11-28'
-  }
   const configuredApi = (
     process.env.GITHUB_API_URL || 'https://api.github.com'
   ).replace(/\/+$/, '')
   const useAuth =
     githubToken !== '' && configuredApi === 'https://api.github.com'
 
-  let res = await fetchWithRetry(
-    RELEASE_API_URL,
-    {
-      method: 'GET',
-      headers: useAuth
-        ? { ...baseHeaders, Authorization: `Bearer ${githubToken}` }
-        : baseHeaders
-    },
-    15000
-  )
-  if ((res.status === 401 || res.status === 403) && useAuth) {
-    res = await fetchWithRetry(
+  if (useAuth) {
+    const { res, bodyData: data } = await fetchWithRetry(
       RELEASE_API_URL,
       {
         method: 'GET',
-        headers: baseHeaders
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${githubToken}`,
+          'User-Agent': 'pbuf-setup-action',
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
       },
-      15000
+      15000,
+      3,
+      DEFAULT_RETRY_DELAY_MS,
+      r => r.json()
     )
-  }
-  if (!res.ok) {
-    throw new Error(
-      `Failed to resolve latest pbuf release tag (status ${res.status})`
-    )
+    if (res.ok) {
+      const tagName =
+        data && typeof data.tag_name === 'string' ? data.tag_name.trim() : ''
+      if (!RELEASE_TAG_RE.test(tagName)) {
+        throw new Error(
+          `Invalid release tag "${tagName}" returned by GitHub API`
+        )
+      }
+      return tagName
+    }
+    await cancelBody(res)
+    if (res.status !== 401 && res.status !== 403 && res.status !== 429) {
+      throw new Error(
+        `Failed to resolve latest pbuf release tag (status ${res.status})`
+      )
+    }
   }
 
-  const data = await res.json()
-  const tagName = typeof data.tag_name === 'string' ? data.tag_name.trim() : ''
+  const redirectRes = await fetchWithRetry(
+    RELEASE_LATEST_WEB_URL,
+    {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { 'User-Agent': 'pbuf-setup-action' }
+    },
+    15000
+  )
+  const location =
+    redirectRes.headers && typeof redirectRes.headers.get === 'function'
+      ? (redirectRes.headers.get('location') || '').trim()
+      : ''
+  await cancelBody(redirectRes)
+
+  let tagName = ''
+  if (redirectRes.status >= 300 && redirectRes.status < 400 && location) {
+    try {
+      const locUrl = new URL(location, RELEASE_LATEST_WEB_URL)
+      const pathMatch =
+        locUrl.origin === 'https://github.com'
+          ? locUrl.pathname.match(
+              /^\/pbufio\/pbuf-registry\/releases\/tag\/([^/]+)\/?$/
+            )
+          : null
+      if (pathMatch) {
+        tagName = decodeURIComponent(pathMatch[1])
+      }
+    } catch {
+      tagName = ''
+    }
+  }
+  if (!tagName) {
+    throw new Error(
+      `Failed to resolve latest pbuf release tag (status ${redirectRes.status})`
+    )
+  }
   if (!RELEASE_TAG_RE.test(tagName)) {
-    throw new Error(`Invalid release tag "${tagName}" returned by GitHub API`)
+    throw new Error(`Invalid release tag "${tagName}" returned by GitHub`)
   }
   return tagName
 }
@@ -3833,19 +3898,21 @@ function parseExpectedChecksum(checksumsText, archiveName) {
   )
 }
 
-function smokeCheckArg(plainVersion) {
+function isMinorAtLeast(plainVersion, minMinor) {
   const [major, minor] = plainVersion.split('.', 2).map(Number)
-  return major === 0 && minor < 17 ? '--help' : '--version'
+  return major > 0 || minor >= minMinor
+}
+
+function smokeCheckArg(plainVersion) {
+  return isMinorAtLeast(plainVersion, 17) ? '--version' : '--help'
 }
 
 function supportsLint(plainVersion) {
-  const [major, minor] = plainVersion.split('.', 2).map(Number)
-  return major > 0 || minor >= 19
+  return isMinorAtLeast(plainVersion, 19)
 }
 
 function supportsLintIgnoreRule(plainVersion) {
-  const [major, minor] = plainVersion.split('.', 2).map(Number)
-  return major > 0 || minor >= 21
+  return isMinorAtLeast(plainVersion, 21)
 }
 
 function parseLintIgnoreRules(raw) {
@@ -4036,8 +4103,21 @@ async function execPbuf(args, workingDirectory = '') {
   }
 }
 
+function resolveNetrcPath() {
+  try {
+    const info = os.userInfo()
+    if (info && info.homedir) {
+      return path.join(info.homedir, '.netrc')
+    }
+  } catch {
+    // fall back to os.homedir() when UID has no /etc/passwd entry
+  }
+  return path.join(os.homedir(), '.netrc')
+}
+
 function backupNetrcBeforeAuth() {
-  const netrcPath = path.join(os.homedir(), '.netrc')
+  const netrcPath = resolveNetrcPath()
+  core.saveState('netrcPath', netrcPath)
   const stat = fs.lstatSync(netrcPath, { throwIfNoEntry: false })
   if (stat && stat.isSymbolicLink()) {
     const target = fs.readlinkSync(netrcPath)
@@ -4045,12 +4125,12 @@ function backupNetrcBeforeAuth() {
     if (fs.existsSync(netrcPath) && fs.statSync(netrcPath).isFile()) {
       existingBytes = fs.readFileSync(netrcPath)
     }
+    core.saveState('netrcMode', 'symlink')
+    core.saveState('netrcSymlinkTarget', target)
     fs.unlinkSync(netrcPath)
     if (existingBytes !== null) {
       fs.writeFileSync(netrcPath, existingBytes, { mode: 0o600, flag: 'wx' })
     }
-    core.saveState('netrcMode', 'symlink')
-    core.saveState('netrcSymlinkTarget', target)
   } else if (stat && stat.isFile()) {
     const tempRoot = (process.env.RUNNER_TEMP || '').trim() || os.tmpdir()
     fs.mkdirSync(tempRoot, { recursive: true })
@@ -4074,7 +4154,7 @@ function cleanupPost() {
   if (!mode) {
     return
   }
-  const netrcPath = path.join(os.homedir(), '.netrc')
+  const netrcPath = core.getState('netrcPath') || resolveNetrcPath()
   const backupPath = core.getState('netrcBackupPath')
   const symlinkTarget = core.getState('netrcSymlinkTarget')
   let staged = ''
@@ -4299,10 +4379,11 @@ async function runDriftDiff(
     stderr,
     exitCode
   )
-  core.setOutput('drift_markdown', markdown)
+  const safeMarkdown = markdown !== '' ? truncateMarkdown(markdown) : ''
+  core.setOutput('drift_markdown', safeMarkdown)
   core.setOutput('drift_exit_code', String(exitCode))
 
-  if (exitCode !== 0 && markdown === '') {
+  if (exitCode !== 0 && safeMarkdown === '') {
     core.setFailed(
       errorMessage || `pbuf drift diff failed with exit code ${exitCode}`
     )
@@ -4310,16 +4391,16 @@ async function runDriftDiff(
   }
 
   core.info(`pbuf drift diff completed (exit code ${exitCode}).`)
-  if (markdown !== '') {
-    core.info(markdown.replace(/(^|\r?\n)(\s*)::/g, '$1$2: :'))
+  if (safeMarkdown !== '') {
+    core.info(safeMarkdown.replace(/(^|[\r\n]+)(\s*)::/g, '$1$2: :'))
   }
 
-  if (markdown !== '' && summaryEnabled) {
-    await writeJobSummary(markdown)
+  if (safeMarkdown !== '' && summaryEnabled) {
+    await writeJobSummary(safeMarkdown)
   }
 
-  if (commentOnPr && markdown !== '') {
-    await upsertPullRequestComment(markdown, githubToken, workingDirectory)
+  if (commentOnPr && safeMarkdown !== '') {
+    await upsertPullRequestComment(safeMarkdown, githubToken, workingDirectory)
   }
 
   if (exitCode !== 0) {
@@ -4348,8 +4429,11 @@ async function run() {
       parseBooleanInput('job_summary', true) &&
       Boolean(process.env.GITHUB_STEP_SUMMARY)
     const workingDirectory = core.getInput('working_directory').trim()
-    const githubToken =
-      core.getInput('github_token') || process.env.GITHUB_TOKEN || ''
+    const githubToken = (
+      core.getInput('github_token') ||
+      process.env.GITHUB_TOKEN ||
+      ''
+    ).trim()
 
     if (version === '') {
       core.setFailed('You must provide a version')
@@ -4375,9 +4459,19 @@ async function run() {
 
     if (pbufToken !== '') {
       core.setSecret(pbufToken)
+      if (/\s/.test(pbufToken)) {
+        core.setFailed('Invalid pbuf_token: token must not contain whitespace')
+        return
+      }
     }
     if (githubToken !== '') {
       core.setSecret(githubToken)
+      if (/\s/.test(githubToken)) {
+        core.setFailed(
+          'Invalid github_token: token must not contain whitespace'
+        )
+        return
+      }
     }
 
     core.info(`Installing pbuf cli version ${version}`)
@@ -4391,18 +4485,33 @@ async function run() {
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
       backupNetrcBeforeAuth()
-      await exec.exec('pbuf', ['auth', '--', pbufToken], {
-        cwd: workingDirectory || undefined,
-        silent: true
-      })
+      const authRes = await execPbuf(
+        ['auth', '--', pbufToken],
+        workingDirectory
+      )
+      if (authRes.exitCode !== 0) {
+        const { errorMessage } = parseDriftCliOutput(
+          authRes.stdout,
+          authRes.stderr,
+          authRes.exitCode
+        )
+        throw new Error(
+          errorMessage || `pbuf auth failed with exit code ${authRes.exitCode}`
+        )
+      }
     }
 
     core.info('Successfully setup pbuf cli')
 
     if (lintEnabled) {
       await runLint(workingDirectory, plainVersion, summaryEnabled)
-    } else if (core.getInput('lint_ignore_rules').trim() !== '') {
-      core.warning('lint_ignore_rules has no effect unless lint is true.')
+    } else if (
+      core.getInput('lint_ignore_rules').trim() !== '' ||
+      core.getInput('lint_paths').trim() !== ''
+    ) {
+      core.warning(
+        'lint_paths and lint_ignore_rules have no effect unless lint is true.'
+      )
     }
 
     if (driftDiffEnabled) {
@@ -4411,6 +4520,10 @@ async function run() {
         githubToken,
         commentOnPr,
         summaryEnabled
+      )
+    } else if (commentOnPr || core.getInput('against').trim() !== '') {
+      core.warning(
+        'comment_on_pr and against have no effect unless drift_diff is true.'
       )
     }
   } catch (error) {
