@@ -344,8 +344,10 @@ describe('action', () => {
     fetchMock.mockRestore()
   })
 
-  it('falls back to $HOME/.local/bin when RUNNER_TOOL_CACHE is unset', async () => {
-    delete process.env.RUNNER_TOOL_CACHE
+  it('falls back to versioned $HOME/.cache/pbuf when RUNNER_TOOL_CACHE is unset or unwritable and reuses cache', async () => {
+    const readOnlyToolCache = path.join(tempDir, 'ro-tool-cache')
+    fs.mkdirSync(readOnlyToolCache, { mode: 0o555 })
+    process.env.RUNNER_TOOL_CACHE = readOnlyToolCache
 
     const archiveName = `pbuf_0.19.0_${osName}_${archName}.tar.gz`
     const fakeArchive = Buffer.from('rootless-tar')
@@ -381,13 +383,25 @@ describe('action', () => {
 
     await main.run()
 
-    const fallbackBin = path.join(fakeHome, '.local', 'bin', 'pbuf')
+    const fallbackDir = path.join(
+      fakeHome,
+      '.cache',
+      'pbuf',
+      '0.19.0',
+      archName
+    )
+    const fallbackBin = path.join(fallbackDir, 'pbuf')
     expect(setFailedMock).not.toHaveBeenCalled()
     expect(fs.existsSync(fallbackBin)).toBe(true)
-    expect(addPathMock).toHaveBeenCalledWith(
-      path.join(fakeHome, '.local', 'bin')
-    )
+    expect(addPathMock).toHaveBeenCalledWith(fallbackDir)
 
+    // Reuses cached binary both when RUNNER_TOOL_CACHE is unwritable and when unset
+    await main.run()
+    delete process.env.RUNNER_TOOL_CACHE
+    await main.run()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    fs.chmodSync(readOnlyToolCache, 0o755)
     fetchMock.mockRestore()
   })
 
@@ -594,7 +608,11 @@ describe('action', () => {
         status: 200,
         headers: { get: () => null },
         json: async () => [
-          { id: 555, body: `${scopedMarker}\nold orders report` }
+          {
+            id: 555,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+            body: `${scopedMarker}\nold orders report`
+          }
         ]
       })
       .mockResolvedValueOnce({
@@ -776,7 +794,11 @@ describe('action', () => {
         status: 200,
         headers: { get: () => null },
         json: async () => [
-          { id: 901, body: `${main.COMMENT_MARKER}\r\nold crlf body` }
+          {
+            id: 901,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+            body: `${main.COMMENT_MARKER}\r\nold crlf body`
+          }
         ]
       })
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) })
@@ -837,7 +859,7 @@ describe('action', () => {
     expect(setFailedMock).not.toHaveBeenCalled()
   })
 
-  it('emits GitHub PR file annotations for pbuf lint violations, caps at 50, and still runs drift_diff', async () => {
+  it('emits GitHub PR file annotations for pbuf lint violations, caps inline errors at 8, and still runs drift_diff', async () => {
     process.env.GITHUB_WORKSPACE = '/workspace/repo'
     const findings = [
       {
@@ -902,7 +924,7 @@ describe('action', () => {
     await main.run()
 
     expect(setOutputMock).toHaveBeenCalledWith('lint_exit_code', '1')
-    expect(errorMock).toHaveBeenCalledTimes(50)
+    expect(errorMock).toHaveBeenCalledTimes(8)
     expect(errorMock).toHaveBeenNthCalledWith(
       1,
       '[FIELD_NAME] field "userId" should be snake_case',
@@ -918,7 +940,7 @@ describe('action', () => {
       file: 'services/shared/empty.proto'
     })
     expect(warningMock).toHaveBeenCalledWith(
-      'Showing first 50 of 52 pbuf lint violations.'
+      'Annotated first 8 of 52 pbuf lint violations inline.'
     )
     expect(setFailedMock).toHaveBeenCalledWith(
       'pbuf lint failed: 52 violation(s) found across 3 file(s)'
@@ -1637,6 +1659,279 @@ describe('action', () => {
       main.fetchWithRetry('https://example.com', {}, 1000, 3, 1)
     ).rejects.toThrow('final network failure')
     nowSpy.mockRestore()
+    fetchMock.mockRestore()
+  })
+
+  it('defends sticky PR comments against spoofing, skips unchanged bot body, and retries POST on 403 Retry-After', async () => {
+    const eventFile = path.join(tempDir, 'spoof-event.json')
+    fs.writeFileSync(
+      eventFile,
+      JSON.stringify({ issue: { number: 88, pull_request: {} } })
+    )
+    process.env.GITHUB_EVENT_PATH = eventFile
+    process.env.GITHUB_REPOSITORY = 'pbufio/example-protos'
+    process.env.GITHUB_WORKSPACE = '/runner/_work/repo/repo'
+
+    expect(
+      main.buildCommentMarker('/runner/_work/repo/repo/proto/orders/')
+    ).toBe('<!-- pbuf-drift-diff:proto/orders -->')
+    expect(main.buildCommentMarker('proto/a/../orders')).toBe(
+      '<!-- pbuf-drift-diff:proto/orders -->'
+    )
+    expect(main.buildCommentMarker('/tmp/runner-secret/pbuf-smoke')).toBe(
+      '<!-- pbuf-drift-diff:pbuf-smoke -->'
+    )
+
+    const report =
+      '### Schema Drift Diff: `acme/orders`\n\nNo breaking changes.'
+    const expectedBody = `${main.COMMENT_MARKER}\n${report}`
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'drift_diff':
+          return 'true'
+        case 'comment_on_pr':
+          return 'true'
+        case 'github_token':
+          return 'ghs_tok'
+        default:
+          return ''
+      }
+    })
+    execMock.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'pbuf' && args[0] === 'drift') {
+        options.listeners.stdout(Buffer.from(`${report}\n`))
+      }
+      return 0
+    })
+
+    // Case 1: Attacker comment on page 1 (even with identical body or external Bot type)
+    // does NOT stop pagination; genuine github-actions[bot] comment on page 2 with identical body skips PATCH.
+    let fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: {
+          get: h =>
+            h === 'link'
+              ? '<https://api.github.com/repositories/1/issues/88/comments?page=2>; rel="next"'
+              : null
+        },
+        json: async () => [
+          {
+            id: 1,
+            user: { login: 'mallory', type: 'User' },
+            body: `${main.COMMENT_MARKER}\nFake clean report`
+          },
+          {
+            id: 2,
+            user: { login: 'evil-app[bot]', type: 'Bot' },
+            body: expectedBody
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => [
+          {
+            id: 3,
+            user: { login: 'github-actions[bot]', type: 'Bot' },
+            body: expectedBody
+          }
+        ]
+      })
+
+    await main.run()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(infoMock).toHaveBeenCalledWith(
+      'Sticky drift diff comment #3 on PR #88 is already up to date'
+    )
+    fetchMock.mockRestore()
+
+    // Case 2: Spoofed comment with identical body when no bot comment exists yet + deleted 404 bot comment:
+    // mallory's comment is ignored without calling PATCH, deleted bot comment 404 falls back to POST,
+    // exact 100 comments without rel="next" stops at 1 GET, and POST retries 403 secondary rate limit with Retry-After.
+    infoMock.mockClear()
+    const hundredComments = Array.from({ length: 100 }, (_, idx) => {
+      if (idx === 0) {
+        return {
+          id: 77,
+          user: { login: 'mallory', type: 'User' },
+          body: expectedBody
+        }
+      }
+      if (idx === 1) {
+        return {
+          id: 78,
+          user: { login: 'github-actions[bot]', type: 'Bot' },
+          body: `${main.COMMENT_MARKER}\nolder report`
+        }
+      }
+      return { id: 100 + idx, user: null, body: 'unrelated' }
+    })
+    fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => hundredComments
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        headers: { get: () => null }
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        headers: { get: h => (h === 'retry-after' ? '0.001' : null) }
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        headers: { get: () => null },
+        json: async () => ({ id: 200 })
+      })
+
+    await main.run()
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock.mock.calls[1][0]).toContain('/issues/comments/78')
+    expect(fetchMock.mock.calls[1][1].method).toBe('PATCH')
+    expect(fetchMock.mock.calls[2][1].method).toBe('POST')
+    expect(fetchMock.mock.calls[3][1].method).toBe('POST')
+    expect(infoMock).toHaveBeenCalledWith(
+      'Posted sticky drift diff comment on PR #88'
+    )
+    fetchMock.mockRestore()
+  })
+
+  it('handles 0400 ~/.netrc, missing $HOME, missing pbuf.yaml warning, and release download/API error branches', async () => {
+    // 1. Missing $HOME directory + missing pbuf.yaml warning, then read-only 0400 ~/.netrc + existing pbuf.yaml
+    const missingHome = path.join(tempDir, 'nonexistent-home')
+    userInfoMock.mockImplementation(() => ({ homedir: missingHome }))
+    homedirMock.mockReturnValue(missingHome)
+
+    const savedState = {}
+    saveStateMock.mockImplementation((k, v) => {
+      savedState[k] = v
+    })
+    getStateMock.mockImplementation(k => savedState[k] || '')
+
+    const workDir = path.join(tempDir, 'svc-dir')
+    fs.mkdirSync(workDir, { recursive: true })
+
+    getInputMock.mockImplementation(name => {
+      switch (name) {
+        case 'version':
+          return 'v0.19.0'
+        case 'pbuf_token':
+          return 'pbuf_secret_tok'
+        case 'working_directory':
+          return workDir
+        default:
+          return ''
+      }
+    })
+
+    await main.run()
+    expect(fs.existsSync(missingHome)).toBe(true)
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'No registry_url, PBUF_REGISTRY_ADDR, or pbuf.yaml found'
+      )
+    )
+
+    // Create 0400 read-only ~/.netrc and a pbuf.yaml -> rewrites as 0600 writable and emits no missing-pbuf.yaml warning
+    for (const k of Object.keys(savedState)) delete savedState[k]
+    warningMock.mockClear()
+    const netrcPath = path.join(missingHome, '.netrc')
+    fs.writeFileSync(netrcPath, 'machine example.com login u password p\n', {
+      mode: 0o400
+    })
+    fs.writeFileSync(path.join(workDir, 'pbuf.yaml'), 'name: acme/svc\n')
+
+    execMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'pbuf' && args[0] === 'auth') {
+        fs.appendFileSync(
+          netrcPath,
+          'machine pbuf.cloud login user password pbuf_secret_tok\n'
+        )
+      }
+      return 0
+    })
+    await main.run()
+    expect(setFailedMock).not.toHaveBeenCalled()
+    expect(warningMock).not.toHaveBeenCalled()
+    await main.run()
+    expect(fs.readFileSync(netrcPath, 'utf8')).toBe(
+      'machine example.com login u password p\n'
+    )
+
+    // 2. Release API malformed tag_name, API 500, checksums 404, and archive 404
+    getStateMock.mockReturnValue('')
+    fs.rmSync(toolCacheDir, { recursive: true, force: true })
+
+    getInputMock.mockImplementation(name => {
+      if (name === 'version') return 'latest'
+      if (name === 'github_token') return 'ghs_tok'
+      return ''
+    })
+    let fetchMock = jest.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ tag_name: 'bad-tag' })
+    })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Invalid release tag "bad-tag" returned by GitHub API'
+    )
+    fetchMock.mockRestore()
+
+    setFailedMock.mockClear()
+    fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 500,
+      headers: { get: () => null }
+    })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Failed to resolve latest pbuf release tag (status 500)'
+    )
+    fetchMock.mockRestore()
+
+    setFailedMock.mockClear()
+    getInputMock.mockImplementation(name =>
+      name === 'version' ? 'v0.19.0' : ''
+    )
+    fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from('x')
+      })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      'Failed to download checksums.txt for v0.19.0 (status 404)'
+    )
+    fetchMock.mockRestore()
+
+    setFailedMock.mockClear()
+    fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '' })
+      .mockResolvedValueOnce({ ok: false, status: 404 })
+    await main.run()
+    expect(setFailedMock).toHaveBeenCalledWith(
+      `Failed to download pbuf_0.19.0_${osName}_${archName}.tar.gz (status 404)`
+    )
     fetchMock.mockRestore()
   })
 })
