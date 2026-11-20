@@ -11,7 +11,7 @@ The `pbuf-setup` GitHub Action installs the `pbuf` CLI on Linux and macOS runner
 
 | Input | Required | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `version` | No | `'v0.21.0'` | Version of `pbuf` CLI to install (for example `'v0.21.0'` or `'latest'`). |
+| `version` | No | `'v0.22.0'` | Version of `pbuf` CLI to install (for example `'v0.22.0'` or `'latest'`). |
 | `pbuf_token` | No | `''` | API token for authenticating with the PBUF registry (`pbuf auth`). |
 | `registry_url` | No | `''` | Self-hosted registry address (`host[:port]` or URL), exported as `PBUF_REGISTRY_ADDR`. |
 | `registry_insecure` | No | `'false'` | When `'true'`, exports `PBUF_REGISTRY_INSECURE=true` for plaintext gRPC connections (used with `registry_url` or `PBUF_REGISTRY_ADDR`). |
@@ -45,7 +45,7 @@ steps:
   - name: Install pbuf CLI
     uses: pbufio/pbuf-setup-action@v1
     with:
-      version: 'v0.21.0'
+      version: 'v0.22.0'
       pbuf_token: ${{ secrets.PBUF_TOKEN }}
 
   - name: Register and Push Module

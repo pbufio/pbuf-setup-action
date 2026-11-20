@@ -22,7 +22,8 @@ const COMMENT_MARKER = '<!-- pbuf-drift-diff -->'
 const MAX_COMMENT_CHARS = 60000
 const TRUNCATION_NOTICE = '\n\n_...report truncated..._'
 const MAX_COMMENT_PAGES = 25
-const MAX_LINT_ANNOTATIONS = 50
+const MAX_LINT_ERROR_ANNOTATIONS = 8
+const MAX_LINT_SUMMARY_ROWS = 50
 const DEFAULT_RETRY_DELAY_MS = process.env.JEST_WORKER_ID ? 0 : 250
 const CLI_FATAL_TRAILER_RE =
   /(?:^|\r?\n)(?:\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+)?failed to execute command:\s*([\s\S]*)$/
@@ -70,18 +71,33 @@ function normalizeRegistryAddr(raw) {
   return host
 }
 
+function resolveWorkspaceRoot() {
+  const workspace = (process.env.GITHUB_WORKSPACE || '').trim()
+  return workspace ? path.resolve(workspace) : process.cwd()
+}
+
 function buildCommentMarker(workingDirectory = '') {
-  const normalized = workingDirectory
-    .trim()
-    .replace(/[\r\n<>]/g, '')
-    .replace(/\\/g, '/')
-    .replace(/\/+/g, '/')
-    .replace(/^(?:\.\/)+/, '')
-    .replace(/\/$/, '')
-  if (normalized === '' || normalized === '.') {
+  const sanitized = workingDirectory.trim().replace(/[\r\n<>]/g, '')
+  if (sanitized === '') {
     return COMMENT_MARKER
   }
-  return `<!-- pbuf-drift-diff:${normalized} -->`
+  const rootDir = resolveWorkspaceRoot()
+  const absDir = path.resolve(rootDir, sanitized)
+  const rel = path.relative(rootDir, absDir).replace(/\\/g, '/')
+  if (rel === '' || rel === '.') {
+    return COMMENT_MARKER
+  }
+  const scoped = (
+    rel !== '..' && !rel.startsWith('../') && !path.isAbsolute(rel)
+      ? rel
+      : path.basename(absDir)
+  )
+    .replace(/\/+/g, '/')
+    .replace(/\/$/, '')
+  if (scoped === '' || scoped === '.') {
+    return COMMENT_MARKER
+  }
+  return `<!-- pbuf-drift-diff:${scoped} -->`
 }
 
 function parseDriftCliOutput(rawStdout, rawStderr, exitCode) {
@@ -169,6 +185,7 @@ async function fetchWithRetry(
   readBody = null
 ) {
   const maxAttempts = Math.max(1, attempts)
+  const isPost = String(options.method || 'GET').toUpperCase() === 'POST'
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let retryAfterMs = 0
     try {
@@ -176,18 +193,25 @@ async function fetchWithRetry(
         ...options,
         signal: AbortSignal.timeout(timeoutMs)
       })
-      if (attempt < maxAttempts && (res.status === 429 || res.status >= 500)) {
-        retryAfterMs = parseRetryAfterMs(res.headers)
+      retryAfterMs = parseRetryAfterMs(res.headers)
+      const isRateLimited =
+        res.status === 429 || (res.status === 403 && retryAfterMs > 0)
+      const isRetryableServerErr = !isPost && res.status >= 500
+      if (attempt < maxAttempts && (isRateLimited || isRetryableServerErr)) {
         await cancelBody(res)
       } else {
-        const bodyData =
-          res.ok && typeof readBody === 'function'
-            ? await readBody(res)
-            : undefined
+        let bodyData
+        if (typeof readBody === 'function') {
+          if (res.ok) {
+            bodyData = await readBody(res)
+          } else {
+            await cancelBody(res)
+          }
+        }
         return readBody ? { res, bodyData } : res
       }
     } catch (error) {
-      if (attempt >= maxAttempts) {
+      if (attempt >= maxAttempts || isPost) {
         throw error
       }
     }
@@ -226,6 +250,10 @@ function getPullRequestNumber() {
   return Number.isInteger(candidate) && candidate > 0 ? candidate : null
 }
 
+function isActionsBotComment(comment) {
+  return Boolean(comment.user && comment.user.login === 'github-actions[bot]')
+}
+
 async function upsertPullRequestComment(
   markdown,
   githubToken,
@@ -250,8 +278,8 @@ async function upsertPullRequestComment(
     }
 
     const marker = buildCommentMarker(workingDirectory)
-    const truncated = truncateMarkdown(markdown)
-    const body = `${marker}\n${truncated}`
+    const body = `${marker}\n${markdown}`
+    const targetNormalized = body.replace(/\r\n/g, '\n')
     const apiBase = (
       process.env.GITHUB_API_URL || 'https://api.github.com'
     ).replace(/\/+$/, '')
@@ -263,7 +291,7 @@ async function upsertPullRequestComment(
       'X-GitHub-Api-Version': '2022-11-28'
     }
 
-    let existingId = null
+    const botMatches = []
     for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
       const listUrl = `${apiBase}/repos/${repository}/issues/${prNumber}/comments?per_page=100&page=${page}`
       const { res: listRes, bodyData: comments } = await fetchWithRetry(
@@ -280,28 +308,40 @@ async function upsertPullRequestComment(
       if (!listRes.ok) {
         throw new Error(`GET comments failed with status ${listRes.status}`)
       }
-      const found = comments.find(comment => {
-        if (!comment || typeof comment.body !== 'string') {
-          return false
+      for (const comment of Array.isArray(comments) ? comments : []) {
+        if (
+          !comment ||
+          typeof comment.body !== 'string' ||
+          !isActionsBotComment(comment)
+        ) {
+          continue
         }
         const trimmedBody = comment.body.replace(/\r\n/g, '\n').trimStart()
-        return trimmedBody === marker || trimmedBody.startsWith(`${marker}\n`)
-      })
-      if (found) {
-        existingId = found.id
+        if (trimmedBody === marker || trimmedBody.startsWith(`${marker}\n`)) {
+          botMatches.push(comment)
+        }
+      }
+      if (botMatches.length > 0) {
         break
       }
       const linkHeader =
         listRes.headers && typeof listRes.headers.get === 'function'
           ? listRes.headers.get('link') || ''
           : ''
-      if (!linkHeader.includes('rel="next"') && comments.length < 100) {
+      if (!linkHeader.includes('rel="next"')) {
         break
       }
     }
 
-    if (existingId) {
-      const patchUrl = `${apiBase}/repos/${repository}/issues/comments/${existingId}`
+    for (const candidate of botMatches) {
+      const existingNormalized = candidate.body.replace(/\r\n/g, '\n')
+      if (existingNormalized === targetNormalized) {
+        core.info(
+          `Sticky drift diff comment #${candidate.id} on PR #${prNumber} is already up to date`
+        )
+        return
+      }
+      const patchUrl = `${apiBase}/repos/${repository}/issues/comments/${candidate.id}`
       const patchRes = await fetchWithRetry(
         patchUrl,
         {
@@ -311,13 +351,17 @@ async function upsertPullRequestComment(
         },
         10000
       )
-      if (!patchRes.ok) {
-        throw new Error(`PATCH comment failed with status ${patchRes.status}`)
+      await cancelBody(patchRes)
+      if (patchRes.ok) {
+        core.info(
+          `Updated sticky drift diff comment #${candidate.id} on PR #${prNumber}`
+        )
+        return
       }
-      core.info(
-        `Updated sticky drift diff comment #${existingId} on PR #${prNumber}`
-      )
-      return
+      if (patchRes.status === 404) {
+        continue
+      }
+      throw new Error(`PATCH comment failed with status ${patchRes.status}`)
     }
 
     const createUrl = `${apiBase}/repos/${repository}/issues/${prNumber}/comments`
@@ -329,8 +373,9 @@ async function upsertPullRequestComment(
         body: JSON.stringify({ body })
       },
       10000,
-      1
+      3
     )
+    await cancelBody(createRes)
     if (!createRes.ok) {
       throw new Error(`POST comment failed with status ${createRes.status}`)
     }
@@ -402,7 +447,6 @@ async function resolveReleaseTag(version, githubToken) {
       }
       return tagName
     }
-    await cancelBody(res)
     if (res.status !== 401 && res.status !== 403 && res.status !== 429) {
       throw new Error(
         `Failed to resolve latest pbuf release tag (status ${res.status})`
@@ -535,8 +579,7 @@ function resolveAnnotationFile(filename, workingDirectory = '') {
   if (typeof filename !== 'string' || filename.trim() === '') {
     return undefined
   }
-  const workspace = (process.env.GITHUB_WORKSPACE || '').trim()
-  const rootDir = workspace ? path.resolve(workspace) : process.cwd()
+  const rootDir = resolveWorkspaceRoot()
   const baseDir = workingDirectory
     ? path.resolve(rootDir, workingDirectory)
     : rootDir
@@ -560,16 +603,32 @@ async function installPbufCli(version, githubToken) {
   const tag = await resolveReleaseTag(version, githubToken)
   const plainVersion = tag.slice(1)
   const toolCacheRoot = (process.env.RUNNER_TOOL_CACHE || '').trim()
-  const installDir = toolCacheRoot
-    ? path.join(toolCacheRoot, 'pbuf', plainVersion, archName)
-    : path.join(os.homedir(), '.local', 'bin')
-  const destBin = path.join(installDir, 'pbuf')
+  const homeCacheDir = path.join(
+    os.homedir(),
+    '.cache',
+    'pbuf',
+    plainVersion,
+    archName
+  )
+  const candidateDirs = toolCacheRoot
+    ? [path.join(toolCacheRoot, 'pbuf', plainVersion, archName), homeCacheDir]
+    : [homeCacheDir]
 
-  if (
-    toolCacheRoot &&
-    fs.existsSync(destBin) &&
-    fs.lstatSync(destBin).isFile()
-  ) {
+  let installDir = candidateDirs[0]
+  let destBin = path.join(installDir, 'pbuf')
+  let foundCached = false
+  for (const dir of candidateDirs) {
+    const candidateBin = path.join(dir, 'pbuf')
+    const stat = fs.lstatSync(candidateBin, { throwIfNoEntry: false })
+    if (stat && stat.isFile()) {
+      installDir = dir
+      destBin = candidateBin
+      foundCached = true
+      break
+    }
+  }
+
+  if (foundCached) {
     core.info(`Reusing cached pbuf ${tag} from ${installDir}`)
   } else {
     const archiveName = `pbuf_${plainVersion}_${osName}_${archName}.tar.gz`
@@ -618,14 +677,30 @@ async function installPbufCli(version, githubToken) {
       await exec.exec('tar', ['-xzof', archivePath, '-C', tmpDir, 'pbuf'])
 
       const extractedBin = path.join(tmpDir, 'pbuf')
-      if (
-        !fs.existsSync(extractedBin) ||
-        !fs.lstatSync(extractedBin).isFile()
-      ) {
+      const extractedStat = fs.lstatSync(extractedBin, {
+        throwIfNoEntry: false
+      })
+      if (!extractedStat || !extractedStat.isFile()) {
         throw new Error(`Regular pbuf binary not found in ${archiveName}`)
       }
 
-      fs.mkdirSync(installDir, { recursive: true })
+      try {
+        fs.mkdirSync(installDir, { recursive: true })
+      } catch (mkdirErr) {
+        if (
+          installDir !== homeCacheDir &&
+          mkdirErr &&
+          (mkdirErr.code === 'EACCES' ||
+            mkdirErr.code === 'EPERM' ||
+            mkdirErr.code === 'EROFS')
+        ) {
+          installDir = homeCacheDir
+          destBin = path.join(installDir, 'pbuf')
+          fs.mkdirSync(installDir, { recursive: true })
+        } else {
+          throw mkdirErr
+        }
+      }
       stagedBin = path.join(
         installDir,
         `.pbuf.${process.pid}.${crypto.randomBytes(4).toString('hex')}`
@@ -685,13 +760,13 @@ function resolveNetrcPath() {
 function backupNetrcBeforeAuth() {
   const netrcPath = resolveNetrcPath()
   core.saveState('netrcPath', netrcPath)
+  fs.mkdirSync(path.dirname(netrcPath), { recursive: true, mode: 0o700 })
   const stat = fs.lstatSync(netrcPath, { throwIfNoEntry: false })
   if (stat && stat.isSymbolicLink()) {
     const target = fs.readlinkSync(netrcPath)
-    let existingBytes = null
-    if (fs.existsSync(netrcPath) && fs.statSync(netrcPath).isFile()) {
-      existingBytes = fs.readFileSync(netrcPath)
-    }
+    const targetStat = fs.statSync(netrcPath, { throwIfNoEntry: false })
+    const existingBytes =
+      targetStat && targetStat.isFile() ? fs.readFileSync(netrcPath) : null
     core.saveState('netrcMode', 'symlink')
     core.saveState('netrcSymlinkTarget', target)
     fs.unlinkSync(netrcPath)
@@ -699,18 +774,21 @@ function backupNetrcBeforeAuth() {
       fs.writeFileSync(netrcPath, existingBytes, { mode: 0o600, flag: 'wx' })
     }
   } else if (stat && stat.isFile()) {
+    const existingBytes = fs.readFileSync(netrcPath)
     const tempRoot = (process.env.RUNNER_TEMP || '').trim() || os.tmpdir()
     fs.mkdirSync(tempRoot, { recursive: true })
     const backupPath = path.join(
       tempRoot,
       `.pbuf-netrc-backup.${process.pid}.${crypto.randomBytes(8).toString('hex')}`
     )
-    fs.writeFileSync(backupPath, fs.readFileSync(netrcPath), {
+    fs.writeFileSync(backupPath, existingBytes, {
       mode: 0o600,
       flag: 'wx'
     })
     core.saveState('netrcMode', 'restore')
     core.saveState('netrcBackupPath', backupPath)
+    fs.unlinkSync(netrcPath)
+    fs.writeFileSync(netrcPath, existingBytes, { mode: 0o600, flag: 'wx' })
   } else {
     core.saveState('netrcMode', 'delete')
   }
@@ -849,7 +927,11 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
   const filesCount = Number.isInteger(report.files) ? report.files : 0
   const summaryRows = []
 
-  for (const finding of findings.slice(0, MAX_LINT_ANNOTATIONS)) {
+  const maxProcessed = summaryEnabled
+    ? MAX_LINT_SUMMARY_ROWS
+    : MAX_LINT_ERROR_ANNOTATIONS
+  for (let i = 0; i < Math.min(findings.length, maxProcessed); i += 1) {
+    const finding = findings[i]
     const rule = typeof finding.rule === 'string' ? finding.rule.trim() : ''
     const props = {
       title: rule ? `pbuf lint (${rule})` : 'pbuf lint'
@@ -869,7 +951,9 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
       typeof finding.message === 'string' && finding.message.trim() !== ''
         ? finding.message.trim()
         : 'Proto lint violation'
-    core.error(`${prefix}${message}`, props)
+    if (i < MAX_LINT_ERROR_ANNOTATIONS) {
+      core.error(`${prefix}${message}`, props)
+    }
     if (summaryEnabled) {
       const location = [file, props.startLine, props.startColumn]
         .filter(Boolean)
@@ -891,8 +975,8 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
       summary.push('', '| Location | Rule | Finding |', '| --- | --- | --- |')
       summary.push(...summaryRows)
     }
-    if (findings.length > MAX_LINT_ANNOTATIONS) {
-      summary.push('', `Showing the first ${MAX_LINT_ANNOTATIONS} findings.`)
+    if (findings.length > MAX_LINT_SUMMARY_ROWS) {
+      summary.push('', `Showing the first ${MAX_LINT_SUMMARY_ROWS} findings.`)
     }
     await writeJobSummary(summary.join('\n'))
   }
@@ -901,9 +985,9 @@ async function runLint(workingDirectory, plainVersion, summaryEnabled) {
     return
   }
 
-  if (findings.length > MAX_LINT_ANNOTATIONS) {
+  if (findings.length > MAX_LINT_ERROR_ANNOTATIONS) {
     core.warning(
-      `Showing first ${MAX_LINT_ANNOTATIONS} of ${findings.length} pbuf lint violations.`
+      `Annotated first ${MAX_LINT_ERROR_ANNOTATIONS} of ${findings.length} pbuf lint violations inline.`
     )
   }
 
@@ -1051,6 +1135,20 @@ async function run() {
 
     if (pbufToken !== '') {
       core.info('Authenticate into the pbuf registry')
+      const authDir = workingDirectory
+        ? path.resolve(workingDirectory)
+        : process.cwd()
+      if (
+        registryUrl === '' &&
+        !process.env.PBUF_REGISTRY_ADDR &&
+        !fs.lstatSync(path.join(authDir, 'pbuf.yaml'), {
+          throwIfNoEntry: false
+        })
+      ) {
+        core.warning(
+          'No registry_url, PBUF_REGISTRY_ADDR, or pbuf.yaml found; pbuf auth will save credentials under "localhost". Run actions/checkout first or set registry_url / working_directory.'
+        )
+      }
       backupNetrcBeforeAuth()
       const authRes = await execPbuf(
         ['auth', '--', pbufToken],
@@ -1103,7 +1201,6 @@ module.exports = {
   buildCommentMarker,
   fetchWithRetry,
   normalizeRegistryAddr,
-  parseBooleanInput,
   parseDriftCliOutput,
   parseExpectedChecksum,
   parseLintIgnoreRules,

@@ -7,6 +7,10 @@ on:
       - main
       - "releases/*"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -76,7 +80,7 @@ jobs:
       - name: Check pbuf CLI
         id: check-pbuf-cli
         run: |
-          pbuf --version | grep "v0.21.0"
+          pbuf --version | grep "v0.22.0"
           SMOKE_DIR="${RUNNER_TEMP}/pbuf-smoke"
           mkdir -p "${SMOKE_DIR}/api" && cd "${SMOKE_DIR}"
           pbuf init pbufio/pbuf-setup-action
